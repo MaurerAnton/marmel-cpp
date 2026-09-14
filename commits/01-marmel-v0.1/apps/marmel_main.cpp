@@ -132,10 +132,18 @@ int main(int argc, char** argv) {
     std::atexit([] { marmel::ui::restore(); });
 
     if (!use_raw) {
+        // Mirrors Rust setup_panic_hook: resolve the log path through the
+        // workspace owner (probe-validated), falling back to the literal.
+        std::string log_path = ".marmel/marmel.log";
         try {
-            std::error_code ec;
-            fs::create_directories(".marmel", ec);
-            rotate_log(".marmel/marmel.log", 5ULL * 1024 * 1024, 3);
+            auto workspace = marmel::harness::Workspace::create_default();
+            log_path = workspace.log_path();
+        } catch (const std::exception& e) {
+            std::cerr << "[marmel] workspace unavailable (" << e.what() << "); using " << log_path
+                      << "\n";
+        }
+        try {
+            rotate_log(log_path, 5ULL * 1024 * 1024, 3);
         } catch (...) {
         }
     }

@@ -200,7 +200,9 @@ private:
 class Workspace {
 public:
     static Workspace at(std::string dir) { return Workspace(std::move(dir)); }
-    /// Default ./.marmel + ensure_writable() handshake.
+    /// Bare default root (`./.marmel`, no I/O — mirrors Rust Default).
+    static Workspace default_workspace();
+    /// Default ./.marmel + ensure_writable() handshake (mirrors Rust new()).
     static Workspace create_default();
     const std::string& root() const { return root_; }
     std::string plan_path() const;

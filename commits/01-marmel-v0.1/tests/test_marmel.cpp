@@ -322,15 +322,16 @@ void t_chat_request_payload_construction() {
 void t_monitor_xml_rescue_and_repetition() {
     using namespace marmel;
     harness::HarnessMonitor mon = harness::HarnessMonitor::with_new_stats();
+    // Exact fixture from tests/test_monitor.rs (flat {"name", "arguments"} form).
     auto calls = mon.rescue_xml(
-        "think <tool_call>{\"function\": \"grep_search\", \"arguments\": {\"pattern\": \"x\"}}"
-        "</tool_call> done");
+        "Let me search the files: <tool_call>{\"name\": \"grep_search\", \"arguments\": "
+        "{\"pattern\": \"fn main\"}}</tool_call>");
     CHECK(calls.size() == 1);
     CHECK(calls[0].name == "grep_search");
     CHECK(calls[0].id.rfind("call_text_", 0) == 0);
     bool blocked = false;
     for (int i = 0; i < 10; i++) {
-        auto iv = mon.observe_tool("read_file", obj({{"path", Json("a")}}));
+        auto iv = mon.observe_tool("read_file", obj({{"path", Json("src/main.rs")}}));
         if (auto err = mon.intervention_error(iv)) {
             CHECK(err->find("TOOL REPETITION DETECTED") != std::string::npos ||
                   err->find("TOOL CYCLE DETECTED") != std::string::npos);
@@ -717,6 +718,50 @@ void t_semantic_json_eq() {
     CHECK(!harness::semantic_json_eq(R"({"a":1})", R"({"a":2})"));
 }
 
+// --- workspace.rs unit tests (test_workspace_creates_and_validates) --------------------------
+void t_tooldef_descriptions_exact() {
+    // Tool schemas are LLM-visible prompt text: assert byte-exact parity with types.rs.
+    using namespace marmel;
+    CHECK(types::ToolDef::replace().description ==
+          "Replace an exact, unique block of text within a file. Fails if old_str matches 0 or "
+          ">1 times.");
+    CHECK(types::ToolDef::run_command().description ==
+          "Execute a command line inside a dedicated PTY with timeout and process-group "
+          "isolation.");
+    CHECK(types::ToolDef::leave_verdict().description ==
+          "Record the final verification verdict for this task. You must call this tool to finish "
+          "validation.");
+    CHECK(types::ToolDef::pty_list().description == "List all active interactive PTY sessions.");
+    auto tools = types::ToolDef::default_tools();
+    CHECK(tools.size() == 16);
+    CHECK(tools.front().name == "delegate_task" && tools.back().name == "leave_verdict");
+}
+
+void t_workspace_creates_and_validates() {
+    using namespace marmel;
+    TempDir tmp;
+    std::string dir = tmp.path + "/ws";
+    CHECK(!fs::exists(dir));
+    harness::Workspace ws = harness::Workspace::at(dir);
+    ws.ensure_writable();
+    CHECK(fs::is_directory(dir));
+    CHECK(ws.plan_path() == dir + "/execution_plan.md");
+    CHECK(ws.log_path() == dir + "/marmel.log");
+    CHECK(ws.forced_phase_path() == dir + "/forced_phase.txt");
+    CHECK(ws.archive_dir() == dir + "/archive");
+    // No probe file left behind.
+    bool empty = fs::is_empty(dir);
+    CHECK(empty);
+}
+
+void t_workspace_default_root() {
+    using namespace marmel;
+    harness::Workspace ws = harness::Workspace::default_workspace();
+    CHECK(ws.root() == ".marmel");
+    CHECK(ws.plan_path() == std::string(".marmel/execution_plan.md"));
+    CHECK(ws.log_path() == std::string(".marmel/marmel.log"));
+}
+
 } // namespace
 
 #define RUN(fn)                                   \
@@ -765,6 +810,9 @@ int main() {
     RUN(t_chunk_utf8_and_commands);
     RUN(t_assemble_deliverable);
     RUN(t_semantic_json_eq);
+    RUN(t_workspace_creates_and_validates);
+    RUN(t_workspace_default_root);
+    RUN(t_tooldef_descriptions_exact);
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed\n";
     return g_fail == 0 ? 0 : 1;
 }

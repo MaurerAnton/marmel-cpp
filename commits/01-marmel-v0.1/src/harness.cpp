@@ -142,6 +142,7 @@ ToolError ToolError::forbidden(std::string tool, std::string caller) {
 ToolError ToolError::execution(std::string detail) { return {Kind::Execution, {}, std::move(detail), {}}; }
 
 // --- Workspace --------------------------------------------------------------------------
+Workspace Workspace::default_workspace() { return Workspace(agent::kMarmelDir); }
 Workspace Workspace::create_default() {
     Workspace w(agent::kMarmelDir);
     w.ensure_writable();
@@ -155,8 +156,14 @@ void Workspace::ensure_writable() const {
     std::error_code ec;
     fs::create_directories(root_, ec);
     if (ec) throw std::runtime_error("creating workspace dir " + root_ + ": " + ec.message());
-    std::string probe =
-        root_ + "/.marmel_probe_" + std::to_string(static_cast<long long>(::getpid()));
+#ifdef __unix__
+    long long pid = static_cast<long long>(::getpid());
+#else
+    // No getpid off-unix; probe uniqueness falls back to a timestamp.
+    long long pid = static_cast<long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+    std::string probe = root_ + "/.marmel_probe_" + std::to_string(pid);
     {
         std::ofstream f(probe, std::ios::binary | std::ios::trunc);
         if (!f) throw std::runtime_error("workspace " + root_ + " is not writable");
