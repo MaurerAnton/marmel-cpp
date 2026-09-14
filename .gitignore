@@ -1,0 +1,24 @@
+# Build outputs
+build/
+cmake-build-*/
+*.o
+*.a
+
+# Binaries
+marmel
+marmel_tests
+
+# Workspace runtime (created by runs)
+/.marmel/
+.marmel
+*.log
+*.log.1
+*.log.2
+*.log.3
+debug.log
+
+# Temp / editor
+*.tmp
+*.swp
+*~
+.DS_Store
