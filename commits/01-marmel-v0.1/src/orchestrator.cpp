@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <thread>
 #include <iostream>
 #include <mutex>
 #include <regex>
@@ -46,8 +47,9 @@ std::string utc_now_rfc3339() {
 #else
     gmtime_r(&t, &tm);
 #endif
+    // chrono::to_rfc3339 emits "+00:00" (no fractional seconds when whole).
     char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S+00:00", &tm);
     return buf;
 }
 
@@ -59,10 +61,6 @@ std::mutex& workers_mutex() {
 std::map<std::string, ActiveWorkerInfo>& workers_map() {
     static std::map<std::string, ActiveWorkerInfo> m;
     return m;
-}
-std::atomic<unsigned long long>& worker_counter() {
-    static std::atomic<unsigned long long> c{0};
-    return c;
 }
 StatusCallback& status_cb() {
     static StatusCallback cb;
@@ -119,9 +117,17 @@ ActiveWorkerGuard::~ActiveWorkerGuard() {
 
 ActiveWorkerGuard register_active_worker(std::optional<std::string> task_id, std::string agent_name,
                                          std::string prompt) {
-    std::string key = task_id && !task_id->empty()
-                          ? *task_id
-                          : agent_name + "-" + std::to_string(++worker_counter());
+    // Key: "{agent}-{tid}" when the tid is non-blank, else "{agent}-{nanos}".
+    std::string key;
+    if (task_id && !trim_copy(*task_id).empty()) {
+        key = agent_name + "-" + *task_id;
+    } else {
+        key = agent_name + "-" +
+              std::to_string(
+                  static_cast<unsigned long long>(std::chrono::steady_clock::now()
+                                                      .time_since_epoch()
+                                                      .count()));
+    }
     ActiveWorkerInfo info{std::move(task_id), std::move(agent_name), std::move(prompt),
                           std::chrono::steady_clock::now()};
     std::lock_guard<std::mutex> l(workers_mutex());
@@ -135,13 +141,16 @@ bool has_active_workers() {
 std::string get_active_subtasks_str() {
     std::lock_guard<std::mutex> l(workers_mutex());
     auto& m = workers_map();
-    if (m.empty()) return "No active subtasks.";
+    if (m.empty()) return "None";
     std::string out;
-    for (auto& [k, v] : m) {
-        if (!out.empty()) out += "\n";
-        out += "- " + v.agent_name;
-        if (v.task_id) out += " on " + *v.task_id;
-        out += ": " + v.prompt.substr(0, 120);
+    for (auto& [id, info] : m) {
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - info.started_at)
+                        .count();
+        std::string task_id_str = info.task_id.value_or(id);
+        out += "- Tool Call ID: " + task_id_str + "\n  Subagent: " + info.agent_name +
+               "\n  Task Prompt: " + info.prompt + "\n  Running For: " + std::to_string(secs) +
+               " seconds\n\n";
     }
     return out;
 }
@@ -246,7 +255,8 @@ std::string brief_for_task(const agent::Plan& plan, const std::string& task_id) 
             }
         }
     }
-    return "Execute the delegated task described by the plan line, producing the deliverable and "
+    // NOTE: upstream embeds a raw newline ("the\ndeliverable", no leading space).
+    return "Execute the delegated task described by the plan line, producing the\ndeliverable and "
            "ending with MISSION COMPLETE (task-id).";
 }
 
@@ -283,19 +293,30 @@ Json FreezeSnapshot::to_json() const {
 FreezeSnapshot FreezeSnapshot::from_json(const Json& v) {
     FreezeSnapshot s;
     s.worker_id = v.str_or("worker_id", "");
+    // Derived Deserialize round-trips the full DelegationRequest, including
+    // image/audio urls; the top-level agent_name wins (not sub_req.agent).
     s.agent = agents::agent_from_str(v.str_or("agent_name", "")).value_or(agents::Agent::Generalist);
     if (v.contains("sub_req") && v.at("sub_req").is_object()) {
         const Json& q = v.at("sub_req");
         agents::DelegationRequest r;
-        r.agent = agents::agent_from_str(q.str_or("agent_name", "")).value_or(s.agent);
+        auto agent = agents::agent_from_str(q.str_or("agent_name", ""));
+        r.agent = agent.value_or(s.agent);
         r.prompt = q.str_or("prompt", "");
         if (q.contains("snippets") && q.at("snippets").is_array())
             for (auto& x : q.at("snippets").as_array())
                 if (x.is_string()) r.snippets.push_back(x.as_string());
         if (q.contains("task_id") && q.at("task_id").is_string()) r.task_id = q.at("task_id").as_string();
+        auto str_vec = [&](const char* key) -> std::optional<std::vector<std::string>> {
+            if (!q.contains(key) || !q.at(key).is_array()) return std::nullopt;
+            std::vector<std::string> out;
+            for (auto& x : q.at(key).as_array())
+                if (x.is_string()) out.push_back(x.as_string());
+            return out;
+        };
+        r.image_urls = str_vec("image_urls");
+        r.audio_urls = str_vec("audio_urls");
         r.recursion_granted = q.value("recursion_granted", Json(false)).as_bool(false);
         s.sub_req = std::move(r);
-        s.agent = s.sub_req.agent;
     }
     return s;
 }
@@ -331,19 +352,24 @@ std::optional<FreezeSnapshot> CrashJournal::frozen() const {
     ss << f.rdbuf();
     std::string t = trim_copy(ss.str());
     if (t.empty()) return std::nullopt;
-    try {
-        return FreezeSnapshot::from_json(Json::parse(t));
-    } catch (...) {
-        return std::nullopt;
-    }
+    return FreezeSnapshot::from_json(Json::parse(t)); // corrupt file is an error (as in Rust)
 }
 void CrashJournal::clear(const std::string& worker_id, bool resolved) const {
-    // Only remove the frozen file when the ids match (never stomp a foreign freeze).
-    bool match = false;
-    if (auto snap = frozen()) match = (snap->worker_id == worker_id);
-    if (match) {
-        std::error_code ec;
-        fs::remove(frozen_path(), ec);
+    // Only remove the frozen file when the ids match (never stomp a foreign
+    // freeze). The journal event preserves the frozen delegation's agent and
+    // task identity on match, else Coder/None (as in Rust).
+    agents::Agent agent = agents::Agent::Coder;
+    std::optional<std::string> task;
+    try {
+        if (auto snap = frozen()) {
+            if (snap->worker_id == worker_id) {
+                agent = snap->agent;
+                task = snap->sub_req.task_id;
+                std::error_code ec;
+                fs::remove(frozen_path(), ec);
+            }
+        }
+    } catch (...) {
     }
     std::ofstream j(journal_path(), std::ios::binary | std::ios::app);
     if (j) {
@@ -351,7 +377,8 @@ void CrashJournal::clear(const std::string& worker_id, bool resolved) const {
         e.emplace("ts", Json(utc_now_rfc3339()));
         e.emplace("kind", Json(resolved ? "resolved" : "failed"));
         e.emplace("worker_id", Json(worker_id));
-        e.emplace("agent", Json("coder")); // foreign-freeze case logs Coder/None (as in Rust)
+        e.emplace("agent", Json(agents::agent_to_string(agent)));
+        if (task) e.emplace("task_id", Json(*task));
         j << Json(std::move(e)).dump() << "\n";
     }
 }
@@ -381,29 +408,41 @@ bool CrashJournal::is_frozen() const { return frozen().has_value(); }
 
 // --- Steer arbitrator -----------------------------------------------------------------------
 std::string build_steer_prompt(const SteerContext& ctx) {
-    std::string agents = ctx.available_agents.empty() ? "coder, debugger, researcher, generalist"
-                                                      : ctx.available_agents;
-    return "Main Goal:\n" + ctx.main_goal + "\n\nOrchestrator Status:\n" + ctx.orchestrator_status +
-           "\n\nPending Approval:\n" + ctx.pending_approval + "\n\nPlan Progress:\n" +
-           ctx.plan_progress + "\n\nFull Plan:\n" + ctx.plan_content +
-           "\n\nAvailable Agents:\n" + agents + "\n\nSteering History:\n" + ctx.steering_history +
-           "\n\nNew User Instruction:\n" + ctx.user_message + "\n\nActive Subtasks:\n" +
-           ctx.active_subtasks;
+    std::string agents = ctx.available_agents;
+    if (agents.empty()) {
+        agents = "- coder: Software engineering, implementation, testing, refactoring.\n"
+                 "- debugger: Bug forensics, fixing failing tests, diagnosing crash traces, "
+                 "investigating tool errors.\n"
+                 "- researcher: Codebase inspection, searching documentation, factual research.\n"
+                 "- generalist: High-level planning, synthesis, multi-domain evaluation.";
+    }
+    auto or_none = [](const std::string& s) { return s.empty() ? "None" : s; };
+    std::string status = ctx.orchestrator_status.empty() ? "Active" : ctx.orchestrator_status;
+    return "Main Session Goal: \"" + ctx.main_goal + "\"\nOrchestrator Status: " + status +
+           "\n\nPending Approval Request:\n" + or_none(ctx.pending_approval) +
+           "\n\nExecution Plan Progress Breakdown:\n" + or_none(ctx.plan_progress) +
+           "\n\nActive Execution Plan (Full Text):\n" + or_none(ctx.plan_content) +
+           "\n\nAvailable Specialist Agents:\n" + agents +
+           "\n\nSteering Conversation History:\n" + or_none(ctx.steering_history) +
+           "\n\nNew User Instruction: \"" + ctx.user_message + "\"\n\nActive Subtasks:\n" +
+           or_none(ctx.active_subtasks) + "\n\nPlease output your decision JSON.";
 }
 
 std::optional<SteerDecision> parse_steer_json(const std::string& text) {
     std::string t = trim_copy(text);
-    // Strip ```json fences.
-    auto fence = t.find("```");
-    if (fence != std::string::npos) {
-        auto nl = t.find('\n', fence);
-        std::string inner = nl == std::string::npos ? "" : t.substr(nl + 1);
-        auto end = inner.rfind("```");
-        if (end != std::string::npos) inner = inner.substr(0, end);
-        t = trim_copy(inner);
-    }
-    if (t.empty() || t.front() != '{') {
-        // Slice the first {...} block.
+    // Strip markdown code fences iff prefixed (```json / ```), trimming any
+    // trailing fence; else slice the first {...} block.
+    static const std::string kFenceJson = "```json";
+    static const std::string kFence = "```";
+    if (t.rfind(kFenceJson, 0) == 0) {
+        t = trim_copy(t.substr(kFenceJson.size()));
+        while (t.size() >= 3 && t.compare(t.size() - 3, 3, "```") == 0)
+            t = trim_copy(t.substr(0, t.size() - 3));
+    } else if (t.rfind(kFence, 0) == 0) {
+        t = trim_copy(t.substr(kFence.size()));
+        while (t.size() >= 3 && t.compare(t.size() - 3, 3, "```") == 0)
+            t = trim_copy(t.substr(0, t.size() - 3));
+    } else if (!t.empty() && t.front() != '{') {
         auto b = t.find('{');
         auto e = t.rfind('}');
         if (b == std::string::npos || e == std::string::npos || e <= b) return std::nullopt;
@@ -450,53 +489,97 @@ std::optional<SteerDecision> SteerDecision::from_json(const Json& v) {
 }
 
 std::pair<std::string, bool> StreamingResponseExtractor::push_chunk(const std::string& chunk) {
+    if (finished_) return {"", false};
     std::string emitted;
-    for (char c : chunk) {
-        if (finished_) break;
-        if (process_char(c, emitted)) break;
-    }
-    return {emitted, finished_};
-}
-bool StreamingResponseExtractor::process_char(char c, std::string& out) {
-    if (finished_) return true;
-    buffer_ += c;
-    // Detect the "response" field opener: "response" followed by optional ws, ':', optional ws, '"'.
+    bool just_finished = false;
     if (!in_response_field_) {
+        buffer_ += chunk;
+        // Look for "response" : "
         static const std::string kNeedle = "\"response\"";
-        if (buffer_.size() >= kNeedle.size() &&
-            buffer_.compare(buffer_.size() - kNeedle.size(), kNeedle.size(), kNeedle) == 0) {
-            // Wait for the opening quote; scan handled below via state re-check.
-        }
         auto pos = buffer_.find(kNeedle);
         if (pos != std::string::npos) {
-            std::size_t i = pos + kNeedle.size();
-            while (i < buffer_.size() && std::isspace(static_cast<unsigned char>(buffer_[i]))) i++;
-            if (i < buffer_.size() && buffer_[i] == ':') {
-                i++;
-                while (i < buffer_.size() && std::isspace(static_cast<unsigned char>(buffer_[i])))
-                    i++;
-                if (i < buffer_.size() && buffer_[i] == '"') {
+            std::string rest = buffer_.substr(pos + kNeedle.size());
+            auto colon = rest.find(':');
+            if (colon != std::string::npos) {
+                std::string after = rest.substr(colon + 1);
+                auto quote = after.find('"');
+                if (quote != std::string::npos) {
                     in_response_field_ = true;
-                    escaping_ = false;
+                    std::string tail = after.substr(quote + 1);
                     buffer_.clear();
-                    return false;
+                    for (char c : tail) {
+                        if (process_char(c, emitted)) {
+                            just_finished = true;
+                            break;
+                        }
+                    }
+                    return {emitted, just_finished};
                 }
             }
         }
-        // Bound the pre-field buffer.
-        if (buffer_.size() > 4096) buffer_.erase(0, buffer_.size() - 4096);
+        return {"", false};
+    }
+    for (char c : chunk) {
+        if (process_char(c, emitted)) {
+            just_finished = true;
+            break;
+        }
+    }
+    return {emitted, just_finished};
+}
+bool StreamingResponseExtractor::process_char(char c, std::string& out) {
+    if (finished_) return true;
+    // Multi-char \uXXXX accumulation (mirrors Option<String> buffer: every
+    // char after \u is collected; decode-or-drop at length 4).
+    if (unicode_active_) {
+        unicode_buf_ += c;
+        if (unicode_buf_.size() == 4) {
+            unsigned cp = 0;
+            bool hex = true;
+            for (char h : unicode_buf_) {
+                cp <<= 4;
+                if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
+                else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+                else hex = false;
+            }
+            // Invalid/surrogate/out-of-range → dropped silently (as in Rust).
+            if (hex && (cp < 0xD800 || cp > 0xDFFF) && cp <= 0x10FFFF && cp != 0) {
+                if (cp < 0x80) {
+                    out += static_cast<char>(cp);
+                } else if (cp < 0x800) {
+                    out += static_cast<char>(0xC0 | (cp >> 6));
+                    out += static_cast<char>(0x80 | (cp & 0x3F));
+                } else if (cp < 0x10000) {
+                    out += static_cast<char>(0xE0 | (cp >> 12));
+                    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                    out += static_cast<char>(0x80 | (cp & 0x3F));
+                } else {
+                    out += static_cast<char>(0xF0 | (cp >> 18));
+                    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                    out += static_cast<char>(0x80 | (cp & 0x3F));
+                }
+            }
+            unicode_buf_.clear();
+            unicode_active_ = false;
+        }
         return false;
     }
-    // Inside the response string: `buffer_` holds chars since field entry, but we
-    // process incrementally — only the new char matters with escape tracking.
     if (escaping_) {
         escaping_ = false;
         switch (c) {
             case 'n': out += '\n'; break;
             case 'r': out += '\r'; break;
             case 't': out += '\t'; break;
-            case 'u': out += 'u'; break; // \uXXXX passed through simplified (documented)
-            default: out += c; break;
+            case '\\': out += '\\'; break;
+            case '"': out += '"'; break;
+            case '/': out += '/'; break;
+            case 'u': unicode_active_ = true; break; // start 4-hex accumulation
+            default:
+                out += '\\';
+                out += c;
+                break;
         }
         return false;
     }
@@ -531,27 +614,55 @@ std::optional<SteerDecision> arbitrate_steer_context_stream(
     req.stream = true;
     req.enable_thinking = false;
     StreamingResponseExtractor extractor;
-    std::string full;
-    try {
-        llm::StreamedReply reply = client.chat_stream(req, [&](const std::string& delta) {
-            auto [emitted, done] = extractor.push_chunk(delta);
-            if (!emitted.empty()) {
-                full += emitted;
-                if (on_delta) on_delta(emitted);
+    bool did_stream_response = false;
+    std::string raw_stream_accum;
+    // 60 s arbitration window (Rust tokio::time::timeout); the stream closure
+    // always continues (returns true) — only the timeout aborts.
+    auto fut = std::async(std::launch::async, [&] {
+        return client.chat_stream(req, [&](const std::string& chunk) {
+            raw_stream_accum += chunk;
+            auto [delta, done] = extractor.push_chunk(chunk);
+            (void)done;
+            if (!delta.empty()) {
+                did_stream_response = true;
+                if (on_delta) on_delta(delta);
             }
-            return !done;
+            return true;
         });
-        (void)reply;
+    });
+    if (fut.wait_for(std::chrono::seconds(60)) != std::future_status::ready) return std::nullopt;
+    llm::StreamedReply reply;
+    try {
+        reply = fut.get();
     } catch (...) {
-        if (stats) stats->record_steer_arbitration();
-        return std::nullopt;
+        return std::nullopt; // no stat recorded (as in Rust)
     }
+    std::string raw = trim_copy(reply.content);
+    if (raw.empty() && !reply.raw.empty()) raw = trim_copy(reply.raw);
+    if (raw.empty() && !raw_stream_accum.empty()) raw = trim_copy(raw_stream_accum);
+    auto decision = parse_steer_json(raw);
+    if (!decision) return std::nullopt; // no stat recorded (as in Rust)
     if (stats) stats->record_steer_arbitration();
-    if (on_delta && !full.empty()) {
-        // Non-streaming compat: surface the whole response when the backend
-        // delivered it without incremental deltas (mirrors on_delta(response)).
-    }
-    return parse_steer_json(full);
+    if (!did_stream_response && decision->response && on_delta) on_delta(*decision->response);
+    return decision;
+}
+
+std::optional<SteerDecision> arbitrate_steer_stream(
+    const llm::ChatClient& client, std::shared_ptr<harness::HarnessStats> stats,
+    const std::string& main_goal, const std::string& plan_content,
+    const std::string& active_subtask, const std::string& user_message,
+    const std::function<void(const std::string&)>& on_delta) {
+    SteerContext ctx;
+    ctx.main_goal = main_goal;
+    ctx.orchestrator_status = "Active";
+    ctx.pending_approval = "None";
+    ctx.plan_progress = "";
+    ctx.plan_content = plan_content;
+    ctx.available_agents = "";
+    ctx.steering_history = "None";
+    ctx.user_message = user_message;
+    ctx.active_subtasks = active_subtask;
+    return arbitrate_steer_context_stream(client, std::move(stats), ctx, on_delta);
 }
 
 std::optional<SteerDecision> arbitrate_steer(const llm::ChatClient& client,
@@ -560,26 +671,28 @@ std::optional<SteerDecision> arbitrate_steer(const llm::ChatClient& client,
                                             const std::string& plan_content,
                                             const std::string& active_subtask,
                                             const std::string& user_message) {
-    SteerContext ctx;
-    ctx.main_goal = main_goal;
-    ctx.plan_content = plan_content;
-    ctx.plan_progress = generate_plan_progress_summary(plan_content);
-    ctx.user_message = user_message;
-    ctx.active_subtasks = active_subtask;
-    return arbitrate_steer_context_stream(client, std::move(stats), ctx, {});
+    return arbitrate_steer_stream(client, std::move(stats), main_goal, plan_content, active_subtask,
+                                  user_message, {});
 }
 
 SteerOutcome arbitrate_steer_stream_with_fallback(
     const llm::ChatClient& client, std::shared_ptr<harness::HarnessStats> stats,
-    const SteerContext& ctx, bool has_active,
+    const std::string& main_goal, const std::string& plan_content,
+    const std::string& active_subtask, const std::string& user_message, bool has_active,
     const std::function<void(const std::string&)>& on_delta) {
-    auto decision = arbitrate_steer_context_stream(client, std::move(stats), ctx, on_delta);
+    auto decision = arbitrate_steer_stream(client, std::move(stats), main_goal, plan_content,
+                                           active_subtask, user_message, on_delta);
     return resolve_steer_outcome(std::move(decision), has_active);
 }
 
-SteerOutcome arbitrate_steer_with_fallback(const std::string& user_message, bool has_active) {
-    (void)user_message;
-    return resolve_steer_outcome(std::nullopt, has_active);
+SteerOutcome arbitrate_steer_with_fallback(const llm::ChatClient& client,
+                                          std::shared_ptr<harness::HarnessStats> stats,
+                                          const std::string& main_goal,
+                                          const std::string& plan_content,
+                                          const std::string& active_subtask,
+                                          const std::string& user_message, bool has_active) {
+    return arbitrate_steer_stream_with_fallback(client, std::move(stats), main_goal, plan_content,
+                                                active_subtask, user_message, has_active, {});
 }
 
 // --- Manager ---------------------------------------------------------------------------
@@ -599,14 +712,27 @@ OrchestratorManager OrchestratorManager::from_config(std::shared_ptr<llm::ChatCl
                                                     const config::Config& cfg) {
     OrchestratorManager m(std::move(client), std::move(plan), std::move(stats));
     m.cfg_ = cfg;
-    m.orchestration_.max_recursion_depth = cfg.orchestration.max_recursion_depth;
-    m.orchestration_.manager_module = cfg.orchestration.manager_module;
+    m.orchestration_.max_recursion_depth = cfg.orchestration.max_recursion_depth == 0
+                                               ? kDefaultMaxRecursionDepth
+                                               : cfg.orchestration.max_recursion_depth;
+    m.orchestration_.manager_module = cfg.orchestration.manager_module.empty()
+                                          ? "src/orchestrator/mod.rs"
+                                          : cfg.orchestration.manager_module;
+    for (auto& [name, sc] : cfg.orchestration.specialists)
+        m.orchestration_.specialists[name] = sc.tools;
     return m;
 }
 
 void OrchestratorManager::guard_no_domain_work() const {
-    if (orchestration_.manager_module.find("/agents/") != std::string::npos)
-        throw std::runtime_error("manager_module must not perform domain work (agents/ detected)");
+    const std::string& module = orchestration_.manager_module;
+    if (!trim_copy(module).empty() && module.find("/agents/") != std::string::npos)
+        throw std::runtime_error("orchestration.manager_module `" + module +
+                                 "` is a specialist (domain) module: the Manager cannot be a "
+                                 "domain worker");
+}
+void OrchestratorManager::abort() {
+    // Abort is a user-initiated halt, not a harness repetition intervention
+    // (PTY teardown is handled by the turn loops; no counter).
 }
 void OrchestratorManager::create_plan(const std::string& markdown) const { plan_.create(markdown); }
 
@@ -649,12 +775,12 @@ agents::Deliverable OrchestratorManager::delegate(const agents::DelegationReques
     }
     delegation_events_.push_back(
         {DelegationEvent::Kind::Completed, req.agent, req.task_id});
-    // Bind task_id & auto check-off (double-gated on the marker).
+    // Bind task_id & auto check-off. The binding is unconditional (even
+    // on Failed/Replan); only the plan flip is double-gated on Complete.
     std::optional<std::string> tid = d.task_id ? d.task_id : req.task_id;
-    if (tid && !tid->empty() && d.marker.is_complete()) {
+    if (tid && !tid->empty() && d.marker.is_complete())
         plan_.check_plan_on_marker(tid, d.content);
-        d.task_id = tid;
-    }
+    if (tid) d.task_id = tid;
     return d;
 }
 
@@ -679,12 +805,10 @@ std::optional<agents::Deliverable> OrchestratorManager::recover_frozen() {
         journal_.clear(snap->worker_id, true);
     } catch (...) {
     }
-    std::optional<std::string> tid =
-        d.task_id ? d.task_id : snap->sub_req.task_id;
-    if (tid && !tid->empty() && d.marker.is_complete()) {
+    std::optional<std::string> tid = d.task_id ? d.task_id : snap->sub_req.task_id;
+    if (tid && !tid->empty() && d.marker.is_complete())
         plan_.check_plan_on_marker(tid, d.content);
-        d.task_id = tid;
-    }
+    if (tid) d.task_id = tid;
     return d;
 }
 
@@ -712,9 +836,9 @@ std::vector<agents::Deliverable> OrchestratorManager::run_executing(
 
 std::string OrchestratorManager::synthesize(const std::vector<agents::Deliverable>& results) {
     std::string out;
-    for (std::size_t i = 0; i < results.size(); i++) {
-        if (i) out += "\n";
-        out += results[i].content;
+    for (auto& r : results) {
+        out += r.content;
+        out += "\n";
     }
     return out;
 }
@@ -745,9 +869,19 @@ orchestrator::DelegateOutcome handle_delegate_task(const Json& args) {
             }
         }
     }
+    // Route through a Manager rooted at the shared `.marmel` plan dir,
+    // hydrated from the REAL loaded config (mirrors try_run_specialist_live's
+    // config::load(None): nested delegation goes live when a backend is
+    // configured, canned otherwise). Unreadable config → defaults.
+    config::Config live_cfg;
+    try {
+        live_cfg = config::load();
+    } catch (...) {
+    }
     auto stats = std::make_shared<harness::HarnessStats>();
-    auto client = std::make_shared<llm::ChatClient>("http://127.0.0.1:11434/v1", "marmel-manager");
-    OrchestratorManager manager(client, agent::Plan::default_plan(), stats);
+    auto client = std::make_shared<llm::ChatClient>(llm::ChatClient::from_config(live_cfg));
+    OrchestratorManager manager =
+        OrchestratorManager::from_config(client, agent::Plan::default_plan(), stats, live_cfg);
     agents::Deliverable d;
     try {
         d = manager.delegate(req);
@@ -822,15 +956,21 @@ std::vector<DeliverableLite> ManagerLoop::run_executing() {
         }
         // LIFO drain (as in Rust).
         std::vector<DeliverableLite> round;
-        bool failed = false;
         while (!handles.empty()) {
             if (abort_flag_->load()) {
-                for (auto& h : handles) {
-                    try {
-                        h.wait();
-                    } catch (...) {
-                    }
-                }
+                // Cancel semantics: stop awaiting, SIGKILL PTY groups, and
+                // let in-flight workers finish detached (a C++ thread cannot
+                // be cancelled; Rust aborts the JoinHandles).
+                std::thread(
+                    [hs = std::move(handles)]() mutable {
+                        for (auto& h : hs) {
+                            try {
+                                h.wait();
+                            } catch (...) {
+                            }
+                        }
+                    })
+                    .detach();
 #ifdef __unix__
                 for (auto pid : active_pty_pids_) harness::kill_process_group(pid);
 #endif
@@ -841,18 +981,25 @@ std::vector<DeliverableLite> ManagerLoop::run_executing() {
             try {
                 agents::Deliverable d = h.get();
                 round.push_back({d.content, d.task_id});
-            } catch (const std::exception& e) {
-                std::cerr << "[marmel] delegation failed: " << e.what() << "\n";
-                failed = true;
-                break;
             } catch (...) {
+                // Hard per-task error aborts the loop (Rust returns Err).
+                // Detach the rest before propagating.
+                std::thread(
+                    [hs = std::move(handles)]() mutable {
+                        for (auto& hh : hs) {
+                            try {
+                                hh.wait();
+                            } catch (...) {
+                            }
+                        }
+                    })
+                    .detach();
 #ifdef __unix__
                 for (auto pid : active_pty_pids_) harness::kill_process_group(pid);
 #endif
-                return results;
+                throw;
             }
         }
-        if (failed) break;
         for (auto& d : round) results.push_back(std::move(d));
     }
     return results;

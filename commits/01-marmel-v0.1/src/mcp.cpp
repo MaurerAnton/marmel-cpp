@@ -226,35 +226,39 @@ public:
     std::string call_tool(const std::string& name, const Json& args) {
         Json::Object params;
         params.emplace("name", Json(name));
-        params.emplace("arguments", args.is_null() ? Json::object() : args);
+        params.emplace("arguments", args);
         Json result = send_request("tools/call", Json(std::move(params)));
+        // Exact content extraction: any item with a string "text" field
+        // contributes it, otherwise the item JSON; '\n' after EVERY item;
+        // top-level "text"; else the whole result unless null.
         std::string out;
-        bool is_error = false;
-        if (result.is_object()) {
-            if (result.contains("isError") && result.at("isError").is_bool())
-                is_error = result.at("isError").as_bool(false);
-            if (result.contains("content") && result.at("content").is_array()) {
-                for (auto& c : result.at("content").as_array()) {
-                    if (!c.is_object()) continue;
-                    if (c.str_or("type", "") == "text" && c.contains("text") &&
-                        c.at("text").is_string()) {
-                        if (!out.empty()) out += "\n";
-                        out += c.at("text").as_string();
-                    }
+        if (result.is_object() && result.contains("content") &&
+            result.at("content").is_array()) {
+            for (auto& c : result.at("content").as_array()) {
+                if (c.is_object() && c.contains("text") && c.at("text").is_string()) {
+                    out += c.at("text").as_string();
+                } else {
+                    out += c.dump();
                 }
-                if (out.empty()) out = result.at("content").dump();
-            } else {
-                out = result.dump();
+                out += "\n";
             }
-        } else {
-            out = result.is_string() ? result.as_string() : result.dump();
+        } else if (result.is_object() && result.contains("text") &&
+                   result.at("text").is_string()) {
+            out += result.at("text").as_string();
+        } else if (!result.is_null()) {
+            out += result.dump();
         }
-        // Trim.
-        while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ' ||
-                                out.back() == '\t'))
-            out.pop_back();
-        std::size_t a = out.find_first_not_of(" \t\n\r");
-        if (a != std::string::npos) out = out.substr(a);
+        bool is_error = result.is_object() && result.contains("isError") &&
+                        result.at("isError").is_bool() && result.at("isError").as_bool(false);
+        // Trim (mirrors output.trim()).
+        auto not_space = [](char ch) {
+            return ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r';
+        };
+        std::size_t b = 0;
+        while (b < out.size() && !not_space(out[b])) b++;
+        std::size_t e = out.size();
+        while (e > b && !not_space(out[e - 1])) e--;
+        out = out.substr(b, e - b);
         if (is_error) throw std::runtime_error(out);
         return out;
     }

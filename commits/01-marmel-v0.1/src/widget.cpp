@@ -2,6 +2,7 @@
 #include "marmel/widget.hpp"
 
 #include <cctype>
+#include <stdexcept>
 
 namespace marmel::widget {
 namespace {
@@ -15,13 +16,16 @@ std::string trim_copy(const std::string& s) {
 bool is_name_start(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
 }
-bool is_name_char(char c) {
-    return is_name_start(c) || (c >= '0' && c <= '9') || c == '-';
-}
+// NOTE: Rust is_name uses ASCII alphanumeric (not Unicode alnum).
 bool valid_name(const std::string& s) {
-    if (s.empty() || !is_name_start(s[0])) return false;
-    for (char c : s)
-        if (!is_name_char(c)) return false;
+    if (s.empty()) return false;
+    unsigned char f = s[0];
+    if (!((f >= 'A' && f <= 'Z') || (f >= 'a' && f <= 'z') || f == '_')) return false;
+    for (unsigned char c : s) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '-'))
+            return false;
+    }
     return true;
 }
 std::string to_lower(std::string s) {
@@ -29,27 +33,22 @@ std::string to_lower(std::string s) {
     return s;
 }
 
-// Strip `//` comments, respecting double quotes.
+// Strip a trailing `//` comment, toggling on EVERY `"` (no escape handling,
+// exactly as in Rust — `//` after an escaped quote IS stripped there too).
 std::string strip_comment(const std::string& line) {
-    bool in_str = false;
+    bool in_string = false;
     for (std::size_t i = 0; i < line.size(); i++) {
         char c = line[i];
-        if (in_str) {
-            if (c == '\\') {
-                i++;
-            } else if (c == '"') {
-                in_str = false;
-            }
-        } else if (c == '"') {
-            in_str = true;
-        } else if (c == '/' && i + 1 < line.size() && line[i + 1] == '/') {
+        if (c == '"') {
+            in_string = !in_string;
+        } else if (c == '/' && !in_string && i + 1 < line.size() && line[i + 1] == '/') {
             return line.substr(0, i);
         }
     }
     return line;
 }
 
-std::vector<std::string> split_words(const std::string& s) {
+std::vector<std::string> split_whitespace(const std::string& s) {
     std::vector<std::string> out;
     std::size_t i = 0;
     while (i < s.size()) {
@@ -61,6 +60,70 @@ std::vector<std::string> split_words(const std::string& s) {
         i = j;
     }
     return out;
+}
+
+struct Cursor {
+    const std::vector<std::string>& lines;
+    std::size_t idx = 0;
+    ParseError fail(std::size_t line, const std::string& message) const {
+        throw ParseError{line + 1, message};
+    }
+    // Skip blank and comment-only lines (comment stripped, then trimmed).
+    void skip_blank_and_comments() {
+        while (idx < lines.size() && trim_copy(strip_comment(lines[idx])).empty()) idx++;
+    }
+};
+
+std::pair<std::string, std::string> parse_prop(const std::string& line) {
+    auto eq = line.find('=');
+    if (eq == std::string::npos)
+        throw std::runtime_error("expected `key = value`, got `" + line + "`");
+    std::string key = trim_copy(line.substr(0, eq));
+    if (!valid_name(key)) throw std::runtime_error("invalid property name `" + key + "`");
+    std::string raw_value = trim_copy(line.substr(eq + 1));
+    if (raw_value.empty()) throw std::runtime_error("property `" + key + "` is missing a value");
+    std::string value;
+    if (raw_value.front() == '"') {
+        std::string rest = raw_value.substr(1);
+        std::string out;
+        bool closed = false;
+        for (std::size_t i = 0; i < rest.size();) {
+            char c = rest[i];
+            if (c == '"') {
+                std::string tail = trim_copy(rest.substr(i + 1));
+                if (!tail.empty())
+                    throw std::runtime_error("unexpected characters after closing quote");
+                closed = true;
+                i++;
+                break;
+            } else if (c == '\\') {
+                if (i + 1 >= rest.size())
+                    throw std::runtime_error("unterminated escape sequence");
+                char e = rest[i + 1];
+                if (e == 'n') out += '\n';
+                else if (e == 't') out += '\t';
+                else if (e == '"') out += '"';
+                else if (e == '\\') out += '\\';
+                else
+                    throw std::runtime_error(std::string("invalid escape `\\") + e + "`");
+                i += 2;
+            } else {
+                out += c;
+                i++;
+            }
+        }
+        if (!closed) throw std::runtime_error("unterminated string literal");
+        value = out;
+    } else {
+        if (raw_value.find('"') != std::string::npos)
+            throw std::runtime_error("unexpected quote in bare value");
+        if (raw_value.find('{') != std::string::npos || raw_value.find('}') != std::string::npos)
+            throw std::runtime_error("unexpected brace in bare value");
+        if (split_whitespace(raw_value).size() != 1)
+            throw std::runtime_error("bare value must not contain whitespace");
+        value = raw_value;
+    }
+    return {key, value};
 }
 
 } // namespace
@@ -96,29 +159,26 @@ std::optional<std::string> Widget::get(const std::string& key) const {
     auto it = props.find(key);
     return it == props.end() ? std::nullopt : std::optional<std::string>{it->second};
 }
-bool Widget::get_bool(const std::string& key, bool fallback) const {
+std::optional<bool> Widget::get_bool(const std::string& key) const {
     auto v = get(key);
-    if (!v) return fallback;
+    if (!v) return std::nullopt;
     std::string t = to_lower(trim_copy(*v));
-    if (t == "true" || t == "yes" || t == "1") return true;
-    if (t == "false" || t == "no" || t == "0") return false;
-    return fallback;
+    return t == "true" || t == "yes" || t == "1";
 }
-unsigned long long Widget::get_u64(const std::string& key, unsigned long long fallback) const {
+std::optional<unsigned long long> Widget::get_u64(const std::string& key) const {
     auto v = get(key);
-    if (!v) return fallback;
+    if (!v) return std::nullopt;
     try {
         std::size_t n = 0;
         unsigned long long u = std::stoull(trim_copy(*v), &n);
-        if (n == 0) return fallback;
+        if (n == 0) return std::nullopt;
         return u;
     } catch (...) {
-        return fallback;
+        return std::nullopt;
     }
 }
 
 std::vector<Widget> parse(const std::string& source) {
-    // Split into logical lines (keep 1-based numbering).
     std::vector<std::string> lines;
     {
         std::size_t i = 0;
@@ -132,113 +192,58 @@ std::vector<Widget> parse(const std::string& source) {
             i = nl + 1;
         }
     }
+    Cursor cur{lines, 0};
     std::vector<Widget> out;
-    std::size_t idx = 0;
-    auto fail = [&](std::size_t line, const std::string& msg) -> std::vector<Widget> {
-        throw ParseError{line + 1, msg};
-    };
-    while (idx < lines.size()) {
-        std::string code = trim_copy(strip_comment(lines[idx]));
-        if (code.empty()) {
-            idx++;
-            continue;
-        }
-        // Header: widget NAME KIND
-        auto words = split_words(code);
-        if (words.empty() || words[0] != "widget")
-            return fail(idx, "expected `widget` definition");
-        if (words.size() < 2 || !valid_name(words[1]))
-            return fail(idx, "invalid widget name");
-        if (words.size() < 3) return fail(idx, "missing widget kind");
-        auto kind = parse_kind(words[2]);
-        if (!kind) return fail(idx, "unknown widget kind `" + words[2] + "`");
-        bool braced = false;
-        if (words.size() > 3) {
-            if (words.size() == 4 && words[3] == "{")
-                braced = true; // `widget NAME KIND {` on one line
-            else
-                return fail(idx, "extra token after widget kind");
+    while (true) {
+        cur.skip_blank_and_comments();
+        if (cur.idx >= lines.size()) break;
+        std::size_t header_line = cur.idx;
+        std::string header = strip_comment(lines[cur.idx]);
+        auto tokens = split_whitespace(header);
+        if (tokens.size() < 2) cur.fail(header_line, "expected `widget <name> <kind>`");
+        if (to_lower(tokens[0]) != "widget") cur.fail(header_line, "expected `widget` keyword");
+        std::string name = tokens[1];
+        if (!valid_name(name)) cur.fail(header_line, "invalid widget name `" + name + "`");
+        if (tokens.size() < 3)
+            cur.fail(header_line, "widget `" + name + "` is missing a kind");
+        auto kind = parse_kind(tokens[2]);
+        if (!kind) cur.fail(header_line, "unknown widget kind `" + tokens[2] + "`");
+        if (tokens.size() > 3)
+            cur.fail(header_line, "unexpected token `" + tokens[3] + "` after kind");
+        cur.idx++;
+        // Expect an opening brace on the next non-blank line.
+        cur.skip_blank_and_comments();
+        if (cur.idx >= lines.size())
+            cur.fail(header_line, "widget `" + name + "` is missing `{`");
+        std::size_t open_line = cur.idx;
+        if (trim_copy(strip_comment(lines[cur.idx])) != "{")
+            cur.fail(open_line, "expected `{` to open the widget body");
+        cur.idx++;
+        std::map<std::string, std::string> props;
+        while (true) {
+            cur.skip_blank_and_comments();
+            if (cur.idx >= lines.size())
+                cur.fail(header_line, "widget `" + name + "` is missing closing `}`");
+            std::size_t line_no = cur.idx;
+            std::string line = trim_copy(strip_comment(lines[cur.idx]));
+            if (line == "}") {
+                cur.idx++;
+                break;
+            }
+            std::pair<std::string, std::string> kv;
+            try {
+                kv = parse_prop(line);
+            } catch (const std::runtime_error& e) {
+                cur.fail(line_no, e.what());
+            }
+            if (!props.emplace(kv.first, kv.second).second)
+                cur.fail(line_no, "duplicate property `" + kv.first + "` in widget `" + name + "`");
+            cur.idx++;
         }
         Widget w;
-        w.name = words[1];
+        w.name = name;
         w.kind = *kind;
-        idx++;
-        if (!braced) {
-            // `{` on the next non-blank line.
-            bool found = false;
-            while (idx < lines.size()) {
-                std::string l = trim_copy(strip_comment(lines[idx]));
-                if (l.empty()) {
-                    idx++;
-                    continue;
-                }
-                if (l != "{") return fail(idx, "missing `{` after widget header");
-                found = true;
-                idx++;
-                break;
-            }
-            if (!found) return fail(lines.size() - 1, "missing `{` after widget header");
-        }
-        // Props until `}`.
-        bool closed = false;
-        while (idx < lines.size()) {
-            std::string raw = strip_comment(lines[idx]);
-            std::string l = trim_copy(raw);
-            if (l.empty()) {
-                idx++;
-                continue;
-            }
-            if (l == "}") {
-                closed = true;
-                idx++;
-                break;
-            }
-            auto eq = l.find('=');
-            if (eq == std::string::npos) return fail(idx, "expected `key = value`");
-            std::string key = trim_copy(l.substr(0, eq));
-            std::string val = trim_copy(l.substr(eq + 1));
-            if (!valid_name(key)) return fail(idx, "invalid property name `" + key + "`");
-            if (w.props.count(key)) return fail(idx, "duplicate property `" + key + "`");
-            if (val.empty()) return fail(idx, "missing value for property `" + key + "`");
-            std::string value;
-            if (val.front() == '"') {
-                // Quoted string with \n \t \" \\ escapes.
-                std::string acc;
-                bool closed_str = false;
-                for (std::size_t i = 1; i < val.size(); i++) {
-                    char c = val[i];
-                    if (c == '\\' && i + 1 < val.size()) {
-                        char e = val[++i];
-                        if (e == 'n') acc += '\n';
-                        else if (e == 't') acc += '\t';
-                        else if (e == '"') acc += '"';
-                        else if (e == '\\') acc += '\\';
-                        else return fail(idx, "bad escape in string");
-                    } else if (c == '"') {
-                        closed_str = true;
-                        std::string rest = trim_copy(val.substr(i + 1));
-                        if (!rest.empty()) return fail(idx, "trailing characters after string");
-                        break;
-                    } else {
-                        acc += c;
-                    }
-                }
-                if (!closed_str) return fail(idx, "unterminated string");
-                value = acc;
-            } else {
-                // Bare token: no whitespace, quotes or braces.
-                for (char c : val) {
-                    if (std::isspace(static_cast<unsigned char>(c)))
-                        return fail(idx, "whitespace in bare value");
-                    if (c == '"' || c == '{' || c == '}')
-                        return fail(idx, "quote/brace in bare value");
-                }
-                value = val;
-            }
-            w.props.emplace(key, value);
-            idx++;
-        }
-        if (!closed) return fail(lines.size() - 1, "missing closing `}`");
+        w.props = std::move(props);
         out.push_back(std::move(w));
     }
     return out;

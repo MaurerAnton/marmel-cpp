@@ -51,7 +51,7 @@ struct Message {
 
     const char* role_str() const;
     std::optional<std::string> content_opt() const;
-    Json to_json(bool preserve_thinking) const;
+    Json to_json() const;
 };
 
 struct ToolDef {
@@ -93,7 +93,7 @@ struct ChatRequest {
     std::optional<bool> enable_thinking;
     std::optional<std::vector<ToolDef>> tools;
 
-    Json to_json(bool preserve_thinking) const;
+    Json to_json() const;
 };
 
 // SSE streaming fragments (Deserialize in Rust).

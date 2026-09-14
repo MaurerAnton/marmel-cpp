@@ -16,7 +16,8 @@ Json schema(const std::initializer_list<std::pair<std::string, Json>>& props,
     Json::Object o;
     o.emplace("type", Json("object"));
     o.emplace("properties", Json(std::move(p)));
-    o.emplace("required", Json(std::move(r)));
+    // NOTE: upstream omits "required" entirely when empty (archive/pty_list).
+    if (required.size() != 0) o.emplace("required", Json(std::move(r)));
     return Json(std::move(o));
 }
 
@@ -75,7 +76,7 @@ std::optional<std::string> Message::content_opt() const {
     return content;
 }
 
-Json Message::to_json(bool preserve_thinking) const {
+Json Message::to_json() const {
     Json::Object o;
     o.emplace("role", Json(role_str()));
     switch (role) {
@@ -88,7 +89,7 @@ Json Message::to_json(bool preserve_thinking) const {
                 o.emplace("content", Json(content));
             else
                 o.emplace("content", Json());
-            if (preserve_thinking && reasoning_content.has_value())
+            if (reasoning_content.has_value())
                 o.emplace("reasoning_content", Json(*reasoning_content));
             if (!tool_calls.empty()) {
                 Json::Array calls;
@@ -98,7 +99,6 @@ Json Message::to_json(bool preserve_thinking) const {
                     fn.emplace("arguments", Json(tc.arguments));
                     Json::Object e;
                     e.emplace("id", Json(tc.id));
-                    e.emplace("type", Json("function"));
                     e.emplace("function", Json(std::move(fn)));
                     calls.emplace_back(Json(std::move(e)));
                 }
@@ -403,7 +403,7 @@ ToolDef ToolDef::from_mcp(const std::string& name, const std::string& descriptio
     ToolDef d;
     d.name = name;
     d.description = description;
-    d.parameters = input_schema.is_object() ? input_schema : schema({}, {});
+    d.parameters = input_schema;
     return d;
 }
 
@@ -417,11 +417,11 @@ std::vector<ToolDef> ToolDef::default_tools(const std::vector<std::string>& role
             pty_close(), pty_list(), rebirth(), leave_verdict()};
 }
 
-Json ChatRequest::to_json(bool preserve_thinking) const {
+Json ChatRequest::to_json() const {
     Json::Object o;
     o.emplace("model", Json(model));
     Json::Array msgs;
-    for (auto& m : messages) msgs.emplace_back(m.to_json(preserve_thinking));
+    for (auto& m : messages) msgs.emplace_back(m.to_json());
     o.emplace("messages", Json(std::move(msgs)));
     if (temperature) o.emplace("temperature", Json(*temperature));
     if (top_p) o.emplace("top_p", Json(*top_p));
@@ -437,43 +437,100 @@ Json ChatRequest::to_json(bool preserve_thinking) const {
     return Json(std::move(o));
 }
 
+/// Strict structural parse: any type error fails the WHOLE chunk (Rust
+/// derived Deserialize), so the SSE consumer drops the line.
+static const Json& req_obj(const Json& v, const char* what) {
+    if (!v.is_object()) throw JsonParseError(std::string("ChatChunk: bad ") + what);
+    return v;
+}
+
 ChatChunk ChatChunk::from_json(const Json& v) {
+    req_obj(v, "chunk");
     ChatChunk c;
-    if (v.contains("id") && v.at("id").is_string()) c.id = v.at("id").as_string();
-    if (!v.contains("choices") || !v.at("choices").is_array()) return c;
+    if (v.contains("id")) {
+        if (v.at("id").is_null()) {
+        } else if (v.at("id").is_string())
+            c.id = v.at("id").as_string();
+        else
+            throw JsonParseError("ChatChunk: bad id");
+    }
+    if (!v.contains("choices") || !v.at("choices").is_array())
+        throw JsonParseError("ChatChunk: bad choices");
     for (auto& ch : v.at("choices").as_array()) {
-        if (!ch.is_object()) continue;
+        req_obj(ch, "choice");
         ChunkChoice choice;
-        if (ch.contains("finish_reason") && ch.at("finish_reason").is_string())
-            choice.finish_reason = ch.at("finish_reason").as_string();
-        if (ch.contains("delta") && ch.at("delta").is_object()) {
-            const Json& d = ch.at("delta");
-            if (d.contains("content") && d.at("content").is_string())
+        if (ch.contains("finish_reason")) {
+            if (ch.at("finish_reason").is_null()) {
+            } else if (ch.at("finish_reason").is_string())
+                choice.finish_reason = ch.at("finish_reason").as_string();
+            else
+                throw JsonParseError("ChatChunk: bad finish_reason");
+        }
+        if (!ch.contains("delta")) throw JsonParseError("ChatChunk: missing delta");
+        const Json& d = req_obj(ch.at("delta"), "delta");
+        if (d.contains("content")) {
+            if (d.at("content").is_null()) {
+            } else if (d.at("content").is_string())
                 choice.delta.content = d.at("content").as_string();
-            auto rc = d.contains("reasoning_content") ? "reasoning_content"
-                      : d.contains("reasoning")       ? "reasoning"
-                                                      : nullptr;
-            if (rc && d.at(rc).is_string()) choice.delta.reasoning_content = d.at(rc).as_string();
-            if (d.contains("tool_calls") && d.at("tool_calls").is_array()) {
+            else
+                throw JsonParseError("ChatChunk: bad content");
+        }
+        const char* rkey = d.contains("reasoning_content") ? "reasoning_content"
+                           : d.contains("reasoning")       ? "reasoning"
+                                                           : nullptr;
+        if (rkey) {
+            if (d.at(rkey).is_null()) {
+            } else if (d.at(rkey).is_string())
+                choice.delta.reasoning_content = d.at(rkey).as_string();
+            else
+                throw JsonParseError("ChatChunk: bad reasoning_content");
+        }
+        if (d.contains("tool_calls")) {
+            if (d.at("tool_calls").is_null()) {
+            } else if (d.at("tool_calls").is_array()) {
                 std::vector<ChunkToolCall> tcs;
                 for (auto& t : d.at("tool_calls").as_array()) {
-                    if (!t.is_object()) continue;
+                    req_obj(t, "tool_call");
                     ChunkToolCall tc;
-                    if (t.contains("index") && t.at("index").is_number())
-                        tc.index = static_cast<std::size_t>(t.at("index").as_int(0));
-                    if (t.contains("id") && t.at("id").is_string()) tc.id = t.at("id").as_string();
-                    if (t.contains("function") && t.at("function").is_object()) {
-                        ChunkToolFunction fn;
-                        const Json& f = t.at("function");
-                        if (f.contains("name") && f.at("name").is_string())
-                            fn.name = f.at("name").as_string();
-                        if (f.contains("arguments") && f.at("arguments").is_string())
-                            fn.arguments = f.at("arguments").as_string();
-                        tc.function = std::move(fn);
+                    // index is REQUIRED (serde usize): missing/non-integer
+                    // fails the whole chunk.
+                    if (!t.contains("index") || !t.at("index").is_integer())
+                        throw JsonParseError("ChatChunk: bad tool_call index");
+                    tc.index = static_cast<std::size_t>(t.at("index").as_u64(0));
+                    if (t.contains("id")) {
+                        if (t.at("id").is_null()) {
+                        } else if (t.at("id").is_string())
+                            tc.id = t.at("id").as_string();
+                        else
+                            throw JsonParseError("ChatChunk: bad tool_call id");
+                    }
+                    if (t.contains("function")) {
+                        if (t.at("function").is_null()) {
+                        } else {
+                            const Json& f = req_obj(t.at("function"), "function");
+                            ChunkToolFunction fn;
+                            if (f.contains("name")) {
+                                if (f.at("name").is_null()) {
+                                } else if (f.at("name").is_string())
+                                    fn.name = f.at("name").as_string();
+                                else
+                                    throw JsonParseError("ChatChunk: bad function name");
+                            }
+                            if (f.contains("arguments")) {
+                                if (f.at("arguments").is_null()) {
+                                } else if (f.at("arguments").is_string())
+                                    fn.arguments = f.at("arguments").as_string();
+                                else
+                                    throw JsonParseError("ChatChunk: bad function arguments");
+                            }
+                            tc.function = std::move(fn);
+                        }
                     }
                     tcs.push_back(std::move(tc));
                 }
                 choice.delta.tool_calls = std::move(tcs);
+            } else {
+                throw JsonParseError("ChatChunk: bad tool_calls");
             }
         }
         c.choices.push_back(std::move(choice));
@@ -490,7 +547,6 @@ std::vector<ToolCall> map_to_tool_calls(const std::map<std::size_t, ChunkToolCal
         if (call.id.empty()) call.id = "call_" + generate_uuid_v4();
         if (tc.function && tc.function->name) call.name = *tc.function->name;
         if (tc.function && tc.function->arguments) call.arguments = *tc.function->arguments;
-        if (call.arguments.empty()) call.arguments = "{}";
         out.push_back(std::move(call));
     }
     return out;

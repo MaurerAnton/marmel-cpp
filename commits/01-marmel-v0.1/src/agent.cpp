@@ -12,9 +12,11 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <map>
 #include <regex>
 #include <sstream>
+#include <thread>
 
 namespace marmel::agent {
 namespace {
@@ -59,7 +61,7 @@ std::size_t message_tokens(const types::Message& m) {
         if (m.reasoning_content) n += approx_tokens(*m.reasoning_content);
         for (auto& tc : m.tool_calls) n += 1 + approx_tokens(tc.name) + approx_tokens(tc.arguments);
     } else if (m.role == types::MsgRole::Tool) {
-        n += 1 + approx_tokens(m.content);
+        n += approx_tokens(m.content);
     } else {
         n += approx_tokens(m.content);
     }
@@ -98,6 +100,20 @@ std::optional<std::string> find_task_id(const std::string& text) {
     return std::nullopt;
 }
 
+/// UTC `%Y%m%d_%H%M%S` stamp (chrono::Utc, as in Rust — not localtime).
+std::string utc_stamp() {
+    auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+    return buf;
+}
+
 } // namespace
 
 // --- context -------------------------------------------------------------------
@@ -115,10 +131,10 @@ std::size_t count_tokens(const std::vector<types::Message>& messages) {
     return n;
 }
 std::size_t compaction_threshold(std::size_t max_tokens) {
-    return static_cast<std::size_t>(std::llround(max_tokens * 0.90));
+    return static_cast<std::size_t>(std::llround(max_tokens * kCompactTriggerRatio));
 }
 std::size_t compaction_target(std::size_t max_tokens) {
-    return static_cast<std::size_t>(std::llround(max_tokens * 0.70));
+    return static_cast<std::size_t>(std::llround(max_tokens * kCompactTargetRatio));
 }
 
 std::vector<types::Message> prune_orphan_tool_messages(std::vector<types::Message> messages) {
@@ -135,10 +151,12 @@ std::vector<types::Message> prune_orphan_tool_messages(std::vector<types::Messag
 }
 
 bool SlowPrefillTracker::record_prefill(std::chrono::milliseconds duration) {
-    turns_since_rebirth_++;
-    if (duration.count() >= static_cast<long long>(kSlowPrefillThresholdSecs * 1000)) {
-        consecutive_slow_++;
-        return consecutive_slow_ >= 2 && turns_since_rebirth_ >= 5;
+    if (turns_since_rebirth_ < std::numeric_limits<std::uint64_t>::max()) turns_since_rebirth_++;
+    // Rust compares duration.as_secs() (truncated whole seconds) >= 300.
+    auto secs = static_cast<unsigned long long>(duration.count() / 1000);
+    if (secs >= kSlowPrefillThresholdSecs) {
+        if (consecutive_slow_ < std::numeric_limits<unsigned>::max()) consecutive_slow_++;
+        return consecutive_slow_ >= 2 && turns_since_rebirth_ >= kMinTurnsAfterRebirth;
     }
     consecutive_slow_ = 0;
     return false;
@@ -154,38 +172,24 @@ void ContextEngine::set_stats(std::shared_ptr<harness::HarnessStats> stats) { st
 void ContextEngine::set_system_prompt(std::string prompt) {
     if (messages_.empty())
         messages_.push_back(types::Message::system(std::move(prompt)));
-    else {
-        messages_[0].role = types::MsgRole::System;
-        messages_[0].content = std::move(prompt);
-        messages_[0].has_content = true;
-    }
+    else
+        messages_[0] = types::Message::system(std::move(prompt));
 }
 void ContextEngine::set_goal(std::string goal) {
     if (messages_.empty()) messages_.push_back(types::Message::system(""));
     if (messages_.size() == 1)
         messages_.push_back(types::Message::user(std::move(goal)));
-    else {
-        messages_[1].role = types::MsgRole::User;
-        messages_[1].content = std::move(goal);
-        messages_[1].has_content = true;
-    }
+    else
+        messages_[1] = types::Message::user(std::move(goal));
 }
 void ContextEngine::append(types::Message msg) { messages_.push_back(std::move(msg)); }
 std::size_t ContextEngine::token_count() const { return count_tokens(messages_); }
 bool ContextEngine::should_compact() const { return token_count() > compaction_threshold(max_context_tokens_); }
 void ContextEngine::compact() {
-    compact_to_target(compaction_target(max_context_tokens_), false);
-    if (stats_) stats_->record_compaction();
-}
-void ContextEngine::reset_compaction_retry_count() { compaction_retry_count_ = 0; }
-
-bool ContextEngine::compact_to_target(std::size_t target, bool force) {
-    std::size_t cur = token_count();
-    if (!force && cur <= target) return false;
-    std::size_t before = messages_.size();
+    std::size_t target = compaction_target(max_context_tokens_);
+    // Always pin the first two messages (no early return).
     std::vector<types::Message> kept;
-    if (!messages_.empty()) kept.push_back(messages_[0]);
-    if (messages_.size() > 1) kept.push_back(messages_[1]);
+    for (std::size_t i = 0; i < messages_.size() && i < 2; i++) kept.push_back(messages_[i]);
     std::size_t total = count_tokens(kept);
     std::vector<types::Message> tail;
     if (messages_.size() > 2) {
@@ -199,12 +203,37 @@ bool ContextEngine::compact_to_target(std::size_t target, bool force) {
     }
     for (auto& m : tail) kept.push_back(std::move(m));
     messages_ = prune_orphan_tool_messages(std::move(kept));
-    return messages_.size() < before;
+    if (stats_) stats_->record_compaction();
+}
+void ContextEngine::reset_compaction_retry_count() { compaction_retry_count_ = 0; }
+
+bool ContextEngine::compact_to_target(std::size_t target, bool force) {
+    std::size_t cur = token_count();
+    if (!force && cur <= target) return false;
+    std::size_t before = messages_.size();
+    std::vector<types::Message> kept;
+    for (std::size_t i = 0; i < messages_.size() && i < 2; i++) kept.push_back(messages_[i]);
+    std::size_t total = count_tokens(kept);
+    std::vector<types::Message> tail;
+    if (messages_.size() > 2) {
+        for (std::size_t i = messages_.size(); i-- > 2;) {
+            std::size_t cost = message_tokens(messages_[i]);
+            if (total + cost > target && !tail.empty()) break;
+            total += cost;
+            tail.push_back(messages_[i]);
+        }
+        std::reverse(tail.begin(), tail.end());
+    }
+    // Return value is pre-prune (Rust: removed = len - (2 + kept_tail)).
+    std::size_t removed = before >= 2 + tail.size() ? before - (2 + tail.size()) : 0;
+    for (auto& m : tail) kept.push_back(std::move(m));
+    messages_ = prune_orphan_tool_messages(std::move(kept));
+    return removed > 0;
 }
 
 bool ContextEngine::compact_context(std::size_t max_tokens) {
     if (token_count() <= max_tokens) return false;
-    std::size_t target = static_cast<std::size_t>(std::llround(max_tokens * 0.80));
+    std::size_t target = static_cast<std::size_t>(std::llround(max_tokens * kCompactOverLimitRatio));
     return compact_to_target(target, false);
 }
 bool ContextEngine::force_compact_context(std::size_t target_tokens) {
@@ -212,13 +241,13 @@ bool ContextEngine::force_compact_context(std::size_t target_tokens) {
 }
 
 bool ContextEngine::compact_with_retry(std::size_t limit) {
-    if (compaction_retry_count_ >= 2) return false;
+    if (compaction_retry_count_ >= kCompactionRetryCap) return false;
     compaction_retry_count_++;
     bool ok;
     if (compaction_retry_count_ == 1 && token_count() > limit) {
         ok = compact_context(limit);
     } else {
-        double ratio = compaction_retry_count_ == 1 ? 0.70 : 0.50;
+        double ratio = compaction_retry_count_ == 1 ? kCompactRetry1Ratio : kCompactRetry2Ratio;
         std::size_t cur = token_count();
         std::size_t target =
             static_cast<std::size_t>(std::llround(std::min(cur, limit) * ratio));
@@ -236,8 +265,12 @@ void ContextEngine::inject_context_limit_exceeded() {
 }
 
 void ContextEngine::perform_rebirth(const std::string& summary) {
-    std::string sys = messages_.empty() ? "" : messages_[0].content;
-    std::string goal = messages_.size() > 1 ? messages_[1].content : "";
+    std::string sys = (!messages_.empty() && messages_[0].role == types::MsgRole::System)
+                          ? messages_[0].content
+                          : "";
+    std::string goal = (messages_.size() > 1 && messages_[1].role == types::MsgRole::User)
+                           ? messages_[1].content
+                           : "";
     std::string slot = goal;
     for (std::size_t i = messages_.size(); i-- > 2;) {
         if (messages_[i].role == types::MsgRole::User && messages_[i].content != goal) {
@@ -325,8 +358,7 @@ void Plan::create(const std::string& plan_markdown) const {
     std::filesystem::create_directories(dir_, ec);
     std::ofstream f(plan_path(), std::ios::binary | std::ios::trunc);
     if (!f) throw std::runtime_error("cannot write plan file: " + plan_path());
-    f << plan_markdown;
-    if (!plan_markdown.empty() && plan_markdown.back() != '\n') f << '\n';
+    f << plan_markdown; // verbatim (no trailing-newline normalization)
 }
 
 std::optional<std::string> Plan::read() const {
@@ -340,14 +372,16 @@ std::optional<std::string> Plan::read() const {
 bool Plan::exists() const {
     std::lock_guard<std::mutex> lock(plan_mutex());
     std::error_code ec;
-    return std::filesystem::is_regular_file(plan_path(), ec);
+    return std::filesystem::exists(plan_path(), ec);
 }
 void Plan::clear() const {
+    // Deletes the active plan + top-level archive snapshot + forced phase;
+    // the archive/ directory itself is kept (as in Rust).
     std::lock_guard<std::mutex> lock(plan_mutex());
     std::error_code ec;
     std::filesystem::remove(plan_path(), ec);
+    std::filesystem::remove(dir_ + "/execution_plan_archive.md", ec);
     std::filesystem::remove(forced_phase_path(), ec);
-    std::filesystem::remove_all(dir_ + "/archive", ec);
 }
 std::vector<std::string> Plan::pending_tasks() const {
     auto c = read();
@@ -381,23 +415,14 @@ std::optional<std::string> Plan::archive() const {
     if (!std::regex_search(content, checked)) return std::nullopt;
     std::error_code ec;
     std::filesystem::create_directories(dir_ + "/archive", ec);
-    auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
-    std::string dest = dir_ + "/archive/execution_plan_" + buf + ".md";
+    std::string dest = dir_ + "/archive/execution_plan_" + utc_stamp() + ".md";
     {
         std::ofstream o(dest, std::ios::binary | std::ios::trunc);
         o << content;
     }
+    // Latest snapshot lives at the TOP level (dir/execution_plan_archive.md).
     {
-        std::ofstream o(dir_ + "/archive/execution_plan_archive.md",
-                        std::ios::binary | std::ios::trunc);
+        std::ofstream o(dir_ + "/execution_plan_archive.md", std::ios::binary | std::ios::trunc);
         o << content;
     }
     std::filesystem::remove(plan_path(), ec);
@@ -443,20 +468,10 @@ bool Plan::check_off(const std::string& task_id) const {
         // Best-effort completion snapshot (keep the active file, as in Rust).
         std::error_code ec;
         std::filesystem::create_directories(dir_ + "/archive", ec);
-        auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        std::tm tm{};
-#ifdef _WIN32
-        localtime_s(&tm, &t);
-#else
-        localtime_r(&t, &tm);
-#endif
-        char buf[32];
-        std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
-        std::ofstream o(dir_ + "/archive/execution_plan_" + buf + ".md",
+        std::ofstream o(dir_ + "/archive/execution_plan_" + utc_stamp() + ".md",
                         std::ios::binary | std::ios::trunc);
         o << out;
-        std::ofstream o2(dir_ + "/archive/execution_plan_archive.md",
-                         std::ios::binary | std::ios::trunc);
+        std::ofstream o2(dir_ + "/execution_plan_archive.md", std::ios::binary | std::ios::trunc);
         o2 << out;
     }
     return true;
@@ -470,9 +485,12 @@ bool Plan::check_plan_on_marker(const std::optional<std::string>& task_id,
                                 const std::string& deliverable) const {
     auto marker = MissionMarker::parse(deliverable);
     if (!marker || !marker->is_complete()) return false;
+    // Explicit override wins, else the marker's own (t-xxx) token. NOTE: an
+    // explicit Some("") flows into check_off("") like upstream (matches the
+    // first unchecked line via contains("")).
     std::optional<std::string> tid = task_id;
     if (!tid && marker->task_id) tid = marker->task_id;
-    if (!tid || tid->empty()) return false;
+    if (!tid) return false;
     return check_off(*tid);
 }
 
@@ -534,6 +552,7 @@ std::optional<std::string> extract_task_id(const std::string& name, const Json& 
     return std::nullopt;
 }
 
+AgentLoop::AgentLoop() : AgentLoop(Plan(kMarmelDir)) {}
 AgentLoop::AgentLoop(Plan plan)
     : plan_(std::move(plan)),
       abort_flag_(std::make_shared<std::atomic<bool>>(false)),
@@ -601,7 +620,7 @@ void AgentLoop::enqueue_tools(const std::vector<Json>& tools) {
 
 bool AgentLoop::check_off_tool(const PendingTool& tool, const std::string& output_content) {
     if (!tool.task_id || tool.task_id->empty()) return false;
-    if (tool.name == "delegate_task" || tool.name == "terminal__delegate_task")
+    if (tool.name == "delegate_task")
         return plan_.check_plan_on_marker(tool.task_id, output_content);
     return plan_.check_off_on_success(*tool.task_id, "ok");
 }
@@ -665,25 +684,45 @@ TurnOutcome AgentLoop::run_turn() {
                     if (dispatcher_) return dispatcher_(t, caller_);
                     return {false, "no tool dispatcher installed"};
                 };
-                // (c) parallel reads
+                // (c) parallel reads, completion order (FuturesUnordered):
+                // abort is checked after each await, before check-off.
                 std::optional<std::string> error;
                 {
-                    std::vector<std::future<std::pair<PendingTool, std::pair<bool, std::string>>>>
-                        futs;
+                    using Fut = std::future<std::pair<PendingTool, std::pair<bool, std::string>>>;
+                    std::vector<Fut> futs;
                     for (auto& t : reads)
                         futs.push_back(std::async(std::launch::async, [&, t] {
                             return std::make_pair(t, run_one(t));
                         }));
-                    for (auto& f : futs) {
-                        if (abort_flag_->load()) {
-                            abort_pty_process_groups();
-                            return TurnOutcome::aborted();
+                    std::vector<bool> done(futs.size(), false);
+                    std::size_t remaining = futs.size();
+                    while (remaining > 0) {
+                        bool progressed = false;
+                        for (std::size_t i = 0; i < futs.size(); i++) {
+                            if (done[i]) continue;
+                            if (futs[i].wait_for(std::chrono::milliseconds(1)) !=
+                                std::future_status::ready)
+                                continue;
+                            done[i] = true;
+                            remaining--;
+                            progressed = true;
+                            auto [tool, res] = futs[i].get();
+                            if (abort_flag_->load()) {
+                                abort_pty_process_groups();
+                                return TurnOutcome::aborted();
+                            }
+                            if (!res.first) {
+                                if (!error) error = res.second;
+                            } else {
+                                check_off_tool(tool, res.second);
+                            }
                         }
-                        auto [tool, res] = f.get();
-                        if (!res.first) {
-                            if (!error) error = res.second;
-                        } else {
-                            check_off_tool(tool, res.second);
+                        if (!progressed && remaining > 0) {
+                            if (abort_flag_->load()) {
+                                abort_pty_process_groups();
+                                return TurnOutcome::aborted();
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         }
                     }
                 }

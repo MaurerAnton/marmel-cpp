@@ -38,6 +38,15 @@ inline constexpr char kContextLimitExceededMessage[] =
     "your history by pruning older messages and tool results. You MUST immediately summarize your progress "
     "and invoke the 'rebirth' tool with your summary to reset your memory properly.)";
 
+// Named budget ratios (Rust COMPACTION_* consts in context.rs).
+inline constexpr double kCompactTriggerRatio = 0.90;
+inline constexpr double kCompactTargetRatio = 0.70;
+inline constexpr double kCompactRetry1Ratio = 0.70;
+inline constexpr double kCompactRetry2Ratio = 0.50;
+inline constexpr double kCompactOverLimitRatio = 0.80;
+inline constexpr unsigned kCompactionRetryCap = 2;
+inline constexpr unsigned long long kMinTurnsAfterRebirth = 5;
+
 std::size_t count_tokens(const std::vector<types::Message>& messages);
 std::size_t compaction_threshold(std::size_t max_tokens); // round(max*0.90)
 std::size_t compaction_target(std::size_t max_tokens);    // round(max*0.70)

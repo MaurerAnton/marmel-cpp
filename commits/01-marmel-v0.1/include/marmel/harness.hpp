@@ -48,6 +48,8 @@
 #include <string>
 #include <vector>
 
+#include "marmel/mcp.hpp"
+
 #include "marmel/agent_loop.hpp"
 #include "marmel/json.hpp"
 #include "marmel/types.hpp"
@@ -171,7 +173,8 @@ public:
     bool is_repeating() const;
 
 private:
-    std::deque<char> buffer_;
+    // Unicode scalar values (Rust VecDeque<char>), decoded from UTF-8 input.
+    std::deque<char32_t> buffer_;
     std::size_t threshold_;
     std::size_t min_len_;
 };
@@ -261,6 +264,10 @@ void set_mcp_tool_checker(std::function<bool(const std::string&)> has,
 void clear_mcp_tool_checker();
 void set_mcp_tool_defs(std::vector<types::ToolDef> defs);
 std::vector<types::ToolDef> mcp_tool_defs();
+
+// Global MCP registry (mirrors set_mcp_manager/get_mcp_manager).
+void set_mcp_manager(std::shared_ptr<const mcp::McpManager> mgr);
+std::shared_ptr<const mcp::McpManager> get_mcp_manager();
 
 /// Legacy/shared table (MCP first, then built-ins), truncated.
 ToolResult dispatch(const ToolInvocation& inv);

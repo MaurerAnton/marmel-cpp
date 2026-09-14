@@ -43,7 +43,8 @@ void ThinkingDemuxer::append_segment(const std::string& s, bool thinking_channel
 }
 
 DeltaKind ThinkingDemuxer::push(const std::string& delta) {
-    DeltaKind last = in_thinking_ ? DeltaKind::Thinking : DeltaKind::Content;
+    if (delta.empty()) return is_in_thinking() ? DeltaKind::Thinking : DeltaKind::Content;
+    DeltaKind last = is_in_thinking() ? DeltaKind::Thinking : DeltaKind::Content;
     push_delta(delta, [&](DeltaKind k, const std::string&) { last = k; });
     return last;
 }
@@ -135,7 +136,7 @@ types::ChatRequest apply_recovery(types::ChatRequest req, const RecoveryAdjustme
 }
 
 std::vector<types::Message> NudgePolicy::nudge(std::vector<types::Message> transcript) const {
-    transcript.push_back(types::Message::user(nudge_text.empty() ? "?" : nudge_text));
+    transcript.push_back(types::Message::user(nudge_text));
     return transcript;
 }
 
@@ -157,11 +158,19 @@ struct SseAccum {
     std::map<std::size_t, types::ChunkToolCall> tools;
     bool done = false;
     bool aborted = false;
+    bool event_seen = false; // any SSE event yet (watchdog)
 };
+
+static std::string trim_trailing_ws(std::string s) {
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' ||
+                          s.back() == '\n'))
+        s.pop_back();
+    return s;
+}
 
 bool consume_sse_data(const std::string& data, SseAccum& acc,
                       const std::function<bool(const std::string&)>& on_delta) {
-    if (data == "[DONE]") {
+    if (trim_trailing_ws(data) == "[DONE]") {
         acc.done = true;
         return true;
     }
@@ -171,7 +180,12 @@ bool consume_sse_data(const std::string& data, SseAccum& acc,
     } catch (...) {
         return false; // ignore non-JSON keep-alives/comments
     }
-    types::ChatChunk chunk = types::ChatChunk::from_json(v);
+    types::ChatChunk chunk;
+    try {
+        chunk = types::ChatChunk::from_json(v);
+    } catch (...) {
+        return false; // structural error fails the whole chunk (serde)
+    }
     for (auto& choice : chunk.choices) {
         if (choice.delta.content) {
             acc.content += *choice.delta.content;
@@ -213,10 +227,8 @@ bool consume_sse_data(const std::string& data, SseAccum& acc,
                 }
             }
         }
-        if (choice.finish_reason &&
-            (*choice.finish_reason == "stop" || *choice.finish_reason == "tool_calls" ||
-             *choice.finish_reason == "length"))
-            acc.done = true;
+        // NOTE: finish_reason is recorded but never ends the stream (only
+        // [DONE]/EOF/abort do, as in Rust).
     }
     return acc.done;
 }
@@ -242,6 +254,7 @@ size_t curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
         pos = nl + 1;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.rfind("data:", 0) == 0) {
+            st->acc->event_seen = true;
             std::string data = line.size() > 5 ? line.substr(5) : "";
             std::size_t a = data.find_first_not_of(" \t");
             if (a != std::string::npos)
@@ -250,8 +263,11 @@ size_t curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
                 data.clear();
             consume_sse_data(data, *st->acc, st->on_delta ? *st->on_delta
                                                           : std::function<bool(const std::string&)>{});
+        } else if (!line.empty() && line[0] == ':') {
+            // SSE comment keep-alive: counts as an event for the watchdog.
+            st->acc->event_seen = true;
         }
-        // `:` comment keep-alives ignored.
+        // Other lines ignored.
     }
     st->buffer.erase(0, pos);
     if (st->acc->aborted) return 0; // abort transfer (CURLE_WRITE_ERROR, handled as abort)
@@ -297,7 +313,6 @@ HttpResult post_once(const std::string& url, const std::string& body,
     curl_multi_add_handle(multi, curl);
     int still_running = 1;
     CURLMcode mc = CURLM_OK;
-    bool first_event_seen = false;
     while (still_running) {
         mc = curl_multi_perform(multi, &still_running);
         if (mc != CURLM_OK) break;
@@ -315,11 +330,10 @@ HttpResult post_once(const std::string& url, const std::string& body,
                     break;
                 }
             }
-            if (!first_event_seen && !state.acc->content.empty()) first_event_seen = true;
-            if (!first_event_seen &&
-                now - start >= std::chrono::seconds(kInitialResponseWatchdogSecs) &&
-                state.acc->content.empty() && state.acc->reasoning.empty() &&
-                state.acc->tools.empty()) {
+            // First-event watchdog: ANY SSE event (data or comment) counts,
+            // matching Rust's first stream.next() item.
+            if (!state.acc->event_seen &&
+                now - start >= std::chrono::seconds(kInitialResponseWatchdogSecs)) {
                 r.transport_error = "initial response timeout (60s watchdog)";
                 curl_multi_remove_handle(multi, curl);
                 curl_multi_cleanup(multi);
@@ -391,7 +405,7 @@ StreamedReply ChatClient::chat_stream(
     types::ChatRequest wire = req;
     if (wire.model.empty()) wire.model = model_;
     wire.stream = true;
-    std::string body = wire.to_json(true).dump();
+    std::string body = wire.to_json().dump();
 
     for (unsigned attempt = 1; attempt <= kMaxAttempts; attempt++) {
         SseAccum acc;
@@ -431,7 +445,7 @@ StreamConfig StreamConfig::from_config(const config::Config& cfg) {
     s.top_p = cfg.top_p;
     s.frequency_penalty = cfg.frequency_penalty;
     s.presence_penalty = cfg.presence_penalty;
-    s.preserve_thinking = false; // intentional upstream default on this path
+    s.preserve_thinking = cfg.preserve_thinking;
     return s;
 }
 
@@ -471,35 +485,20 @@ std::string VecSink::thinking() const {
 }
 
 namespace {
-types::Message finish_turn(StreamedReply reply, const StreamConfig& cfg, StreamSink& sink,
-                           std::shared_ptr<harness::HarnessStats> stats) {
-    // Post-hoc demux (drive_streamed_turn path).
-    ThinkingDemuxer demux = ThinkingDemuxer::with_preserve(cfg.preserve_thinking);
-    demux.demux_all(reply.raw);
-    if (!demux.thinking().empty()) sink.emit(StreamEvent::thinking(demux.thinking()));
-    if (!demux.content().empty()) sink.emit(StreamEvent::content(demux.content()));
-    std::string content = demux.content();
-    std::string thinking = demux.thinking();
-    // Fall back to transport-split fields when raw was empty (e.g. tests).
-    if (content.empty() && !reply.content.empty()) {
-        content = reply.content;
-        sink.emit(StreamEvent::content(content));
+/// Shared finish path for both turn drivers: into_message + extend with the
+/// transport tool calls + unconditional XML rescue on empty tool calls with
+/// Some content (mirrors stream.rs).
+void finish_message_tools(types::Message& msg, const std::vector<types::ToolCall>& transported) {
+    msg.tool_calls.insert(msg.tool_calls.end(), transported.begin(), transported.end());
+    if (msg.tool_calls.empty() && msg.has_content && !msg.content.empty()) {
+        harness::HarnessMonitor mon = harness::HarnessMonitor::with_new_stats();
+        auto rescued = mon.rescue_xml(msg.content);
+        if (!rescued.empty()) msg.tool_calls = std::move(rescued);
     }
-    if (thinking.empty() && !reply.reasoning.empty()) {
-        thinking = reply.reasoning;
-        sink.emit(StreamEvent::thinking(thinking));
-    }
-    types::Message msg = types::Message::assistant(
-        content.empty() ? std::optional<std::string>{} : std::optional<std::string>{content},
-        thinking.empty() ? std::optional<std::string>{} : std::optional<std::string>{thinking},
-        reply.tool_calls);
-    // XML-rescue fallback for non-compliant models.
-    if (msg.tool_calls.empty() && !content.empty() && content.find("<tool_call") != std::string::npos) {
-        harness::HarnessMonitor mon(stats ? stats : std::make_shared<harness::HarnessStats>());
-        auto rescued = mon.rescue_xml(content);
-        for (auto& tc : rescued) msg.tool_calls.push_back(tc);
-    }
-    return msg;
+}
+void emit_nudge_status(StreamSink& sink, unsigned attempt, const NudgePolicy& nudges) {
+    sink.emit(StreamEvent::status("empty production — nudge " + std::to_string(attempt) + "/" +
+                                  std::to_string(nudges.max_attempts_count())));
 }
 } // namespace
 
@@ -508,25 +507,36 @@ types::Message drive_streamed_turn(
     std::vector<types::Message> messages, const StreamConfig& cfg, StreamSink& sink,
     std::shared_ptr<harness::HarnessStats> stats) {
     if (!stats) stats = std::make_shared<harness::HarnessStats>();
-    StreamConfig cur = cfg;
-    unsigned empty_attempts = 0;
+    std::vector<types::Message> transcript = messages;
     NudgePolicy nudges;
+    unsigned empty_attempts = 0;
+    StreamConfig cur = cfg;
     while (true) {
-        types::ChatRequest req = build_request(cur, messages);
+        types::ChatRequest req = build_request(cur, transcript);
         if (cur.recovery) {
             cur.recovery = false;
             req = apply_recovery(req, RecoveryAdjustment{});
         }
         StreamedReply reply = chat(req);
-        types::Message msg = finish_turn(std::move(reply), cur, sink, stats);
-        if (!is_empty_production(msg)) return msg;
-        if (!nudges.should_nudge(empty_attempts)) return msg;
-        sink.emit(StreamEvent::status("empty production — nudge " + std::to_string(empty_attempts + 1) +
-                                      "/3"));
-        stats->record_empty_prod();
-        messages.push_back(msg);
-        messages = nudges.nudge(std::move(messages));
-        empty_attempts++;
+        ThinkingDemuxer demux = ThinkingDemuxer::with_preserve(cur.preserve_thinking);
+        auto emit_seg = [&](DeltaKind k, const std::string& text) {
+            sink.emit(k == DeltaKind::Thinking ? StreamEvent::thinking(text)
+                                               : StreamEvent::content(text));
+        };
+        demux.push_delta(reply.raw, emit_seg);
+        demux.finish_delta(emit_seg);
+        types::Message assistant = demux.into_message();
+        finish_message_tools(assistant, reply.tool_calls);
+        if (is_empty_production(assistant) && nudges.should_nudge(empty_attempts)) {
+            empty_attempts++;
+            emit_nudge_status(sink, empty_attempts, nudges);
+            stats->record_empty_prod();
+            transcript.push_back(assistant);
+            transcript = nudges.nudge(std::move(transcript));
+            continue;
+        }
+        transcript.push_back(assistant);
+        return transcript.back();
     }
 }
 
@@ -534,63 +544,43 @@ types::Message chat_client_turn(const ChatClient& client, std::vector<types::Mes
                                 const StreamConfig& cfg, StreamSink& sink,
                                 std::shared_ptr<harness::HarnessStats> stats) {
     if (!stats) stats = std::make_shared<harness::HarnessStats>();
-    StreamConfig cur = cfg;
-    unsigned empty_attempts = 0;
+    std::vector<types::Message> transcript = messages;
     NudgePolicy nudges;
+    unsigned empty_attempts = 0;
+    StreamConfig cur = cfg;
     while (true) {
-        types::ChatRequest req = build_request(cur, messages);
+        types::ChatRequest req = build_request(cur, transcript);
         if (cur.recovery) {
             cur.recovery = false;
             req = apply_recovery(req, RecoveryAdjustment{});
         }
         ThinkingDemuxer demux = ThinkingDemuxer::with_preserve(cur.preserve_thinking);
-        std::map<std::size_t, types::ChunkToolCall> acc;
-        bool aborted = false;
-        StreamedReply reply;
-        try {
-            reply = client.chat_stream(req, [&](const std::string& delta) {
-                if (sink.is_aborted()) {
-                    aborted = true;
-                    return false;
-                }
+        StreamedReply reply = client.chat_stream(req, [&](const std::string& delta) {
+            if (!delta.empty()) {
                 demux.push_delta(delta, [&](DeltaKind k, const std::string& seg) {
                     sink.emit(k == DeltaKind::Thinking ? StreamEvent::thinking(seg)
                                                       : StreamEvent::content(seg));
                 });
-                return true;
-            });
-        } catch (...) {
-            demux.finish_delta([&](DeltaKind k, const std::string& seg) {
-                sink.emit(k == DeltaKind::Thinking ? StreamEvent::thinking(seg)
-                                                  : StreamEvent::content(seg));
-            });
-            throw;
+            }
+            return !sink.is_aborted();
+        });
+        auto emit_seg = [&](DeltaKind k, const std::string& text) {
+            sink.emit(k == DeltaKind::Thinking ? StreamEvent::thinking(text)
+                                               : StreamEvent::content(text));
+        };
+        demux.finish_delta(emit_seg);
+        types::Message assistant = demux.into_message();
+        finish_message_tools(assistant, reply.tool_calls);
+        if (is_empty_production(assistant) && nudges.should_nudge(empty_attempts)) {
+            empty_attempts++;
+            emit_nudge_status(sink, empty_attempts, nudges);
+            stats->record_empty_prod();
+            transcript.push_back(assistant);
+            transcript = nudges.nudge(std::move(transcript));
+            continue;
         }
-        demux.finish();
-        (void)aborted;
-        reply.content = demux.content();
-        reply.reasoning = demux.thinking();
-        // NOTE: chat_stream already reassembled tool_calls into reply.
-        types::Message msg = types::Message::assistant(
-            reply.content.empty() ? std::optional<std::string>{}
-                                  : std::optional<std::string>{reply.content},
-            reply.reasoning.empty() ? std::optional<std::string>{}
-                                    : std::optional<std::string>{reply.reasoning},
-            reply.tool_calls);
-        if (msg.tool_calls.empty() && !reply.content.empty() &&
-            reply.content.find("<tool_call") != std::string::npos) {
-            harness::HarnessMonitor mon(stats);
-            for (auto& tc : mon.rescue_xml(reply.content)) msg.tool_calls.push_back(tc);
-        }
-        (void)acc;
-        if (!is_empty_production(msg)) return msg;
-        if (!nudges.should_nudge(empty_attempts)) return msg;
-        sink.emit(StreamEvent::status("empty production — nudge " + std::to_string(empty_attempts + 1) +
-                                      "/3"));
-        stats->record_empty_prod();
-        messages.push_back(msg);
-        messages = nudges.nudge(std::move(messages));
-        empty_attempts++;
+        transcript.push_back(assistant);
+        return transcript.back();
     }
 }
 

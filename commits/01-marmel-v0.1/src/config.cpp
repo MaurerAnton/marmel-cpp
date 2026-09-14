@@ -1,6 +1,7 @@
 // Rust origin: src/config.rs
 #include "marmel/config.hpp"
 
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -112,9 +113,10 @@ std::optional<std::string> home_dir() {
         if (*h) return std::string(h);
     }
 #ifndef _WIN32
-    if (const char* u = getpwuid(getuid())->pw_dir) {
-        // NOTE: getpwuid result used immediately; matches Rust libc fallback.
-        if (u && *u) return std::string(u);
+    {
+        errno = 0;
+        struct passwd* pw = getpwuid(getuid());
+        if (pw && pw->pw_dir && *pw->pw_dir) return std::string(pw->pw_dir);
     }
 #else
     if (const char* h = std::getenv("USERPROFILE")) {
@@ -124,14 +126,15 @@ std::optional<std::string> home_dir() {
     return std::nullopt;
 }
 
-std::string expand_path(const std::string& p) {
-    if (p.rfind("~/", 0) == 0 || p == "~") {
-        if (auto h = home_dir()) return *h + p.substr(1);
-        return p;
-    }
+std::string expand_path(const std::string& p, const std::optional<std::string>& home) {
+    if (!home) return p; // HOME unavailable: leave relative (as in Rust)
+    if (!p.empty() && p[0] == '~') return *home + p.substr(1);
     fs::path path(p);
     if (path.is_absolute()) return p;
-    return (fs::current_path() / path).string();
+    std::error_code ec;
+    std::string cwd = fs::current_path(ec).string();
+    if (ec) cwd = ".";
+    return (fs::path(cwd) / path).string();
 }
 
 struct Partial {
@@ -146,6 +149,105 @@ struct Partial {
     std::map<std::string, SpecialistConfig> specialists;
     std::map<std::string, mcp::McpServerConfig> mcp_servers;
 };
+
+void apply_specialist_kv(SpecialistConfig& sc, const std::string& key, const std::string& val) {
+    bool b = false;
+    unsigned long long u = 0;
+    if (key == "module") sc.module = unquote(val);
+    else if (key == "tools") sc.tools = parse_str_array(val);
+    else if (key == "model") sc.model = unquote(val);
+    else if (key == "backend_url") sc.backend_url = unquote(val);
+    else if (key == "auth_token") sc.auth_token = unquote(val);
+    else if (key == "validator_model") sc.validator_model = unquote(val);
+    else if (key == "validator_backend_url") sc.validator_backend_url = unquote(val);
+    else if (key == "validator_auth_token") sc.validator_auth_token = unquote(val);
+    else if (key == "max_validator_iterations" && parse_ull(val, u))
+        sc.max_validator_iterations = static_cast<std::size_t>(u);
+    else if ((key == "enable_validator" || key == "auto_validate" || key == "enable_validation") &&
+             parse_bool(val, b))
+        sc.enable_validator = b;
+}
+
+void apply_specialist_kv(SpecialistConfig& sc,
+                         const std::map<std::string, std::string>& table) {
+    for (auto& [key, val] : table) apply_specialist_kv(sc, key, val);
+}
+
+/// Split a flat TOML inline table `{ k = v, ... }` into raw values.
+/// Commas inside quotes/brackets do not split; braces must balance.
+std::map<std::string, std::string> parse_inline_table(const std::string& text) {
+    std::map<std::string, std::string> out;
+    std::string t = trim(text);
+    if (t.size() < 2 || t.front() != '{') return out;
+    int depth = 0;
+    bool in_s = false;
+    char q = 0;
+    std::size_t end = std::string::npos;
+    for (std::size_t i = 0; i < t.size(); i++) {
+        char c = t[i];
+        if (in_s) {
+            if (c == '\\') i++;
+            else if (c == q) in_s = false;
+        } else if (c == '"' || c == '\'') {
+            in_s = true;
+            q = c;
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            if (--depth == 0) {
+                end = i;
+                break;
+            }
+        }
+    }
+    std::string inner = (end == std::string::npos) ? t.substr(1) : t.substr(1, end - 1);
+    std::vector<std::string> parts;
+    {
+        std::string cur;
+        in_s = false;
+        int bdepth = 0;
+        for (std::size_t i = 0; i < inner.size(); i++) {
+            char c = inner[i];
+            if (in_s) {
+                cur += c;
+                if (c == '\\' && i + 1 < inner.size()) cur += inner[++i];
+                else if (c == q) in_s = false;
+            } else if (c == '"' || c == '\'') {
+                in_s = true;
+                q = c;
+                cur += c;
+            } else if (c == '[') {
+                bdepth++;
+                cur += c;
+            } else if (c == ']') {
+                if (bdepth > 0) bdepth--;
+                cur += c;
+            } else if (c == ',' && bdepth == 0) {
+                parts.push_back(cur);
+                cur.clear();
+            } else {
+                cur += c;
+            }
+        }
+        parts.push_back(cur);
+    }
+    for (auto& part : parts) {
+        auto eq = part.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = trim(part.substr(0, eq));
+        std::string val = trim(part.substr(eq + 1));
+        if (key.empty() || val.empty()) continue;
+        if (key.size() >= 2 && ((key.front() == '"' && key.back() == '"') ||
+                                (key.front() == '\'' && key.back() == '\'')))
+            key = key.substr(1, key.size() - 2);
+        if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') ||
+                                (val.front() == '\'' && val.back() == '\'')))
+            out[key] = unquote(val);
+        else
+            out[key] = val;
+    }
+    return out;
+}
 
 void apply_kv(Partial& p, const std::string& section, const std::string& key, const std::string& val,
               std::string& cur_specialist, std::string& cur_mcp) {
@@ -191,22 +293,7 @@ void apply_kv(Partial& p, const std::string& section, const std::string& key, co
         return;
     }
     if (section == "specialist") {
-        SpecialistConfig& sc = p.specialists[cur_specialist];
-        bool b = false;
-        unsigned long long u = 0;
-        if (key == "module") sc.module = unquote(val);
-        else if (key == "tools") sc.tools = parse_str_array(val);
-        else if (key == "model") sc.model = unquote(val);
-        else if (key == "backend_url") sc.backend_url = unquote(val);
-        else if (key == "auth_token") sc.auth_token = unquote(val);
-        else if (key == "validator_model") sc.validator_model = unquote(val);
-        else if (key == "validator_backend_url") sc.validator_backend_url = unquote(val);
-        else if (key == "validator_auth_token") sc.validator_auth_token = unquote(val);
-        else if (key == "max_validator_iterations" && parse_ull(val, u))
-            sc.max_validator_iterations = static_cast<std::size_t>(u);
-        else if ((key == "enable_validator" || key == "auto_validate" || key == "enable_validation") &&
-                 parse_bool(val, b))
-            sc.enable_validator = b;
+        apply_specialist_kv(p.specialists[cur_specialist], key, val);
         return;
     }
     if (section == "mcp") {
@@ -214,10 +301,31 @@ void apply_kv(Partial& p, const std::string& section, const std::string& key, co
         if (key == "command") mc.command = unquote(val);
         else if (key == "args") mc.args = parse_str_array(val);
         else if (key == "url") mc.url = unquote(val);
-        else if (key.rfind("env.", 0) == 0) mc.env[key.substr(4)] = unquote(val);
+        else if (key == "env" && !val.empty() && val.front() == '{') {
+            for (auto& [ek, ev] : parse_inline_table(val)) mc.env[ek] = ev;
+        } else if (key.rfind("env.", 0) == 0)
+            mc.env[key.substr(4)] = unquote(val);
+        return;
+    }
+    if (section == "mcp_env") {
+        mcp::McpServerConfig& mc = p.mcp_servers[cur_mcp];
+        mc.env[key] = unquote(val);
+        return;
+    }
+    if (section == "specialists_bare") {
+        // `coder = {...}` inline table under [orchestration.specialists].
+        if (!val.empty() && val.front() == '{') {
+            SpecialistConfig& sc = p.specialists[key];
+            apply_specialist_kv(sc, parse_inline_table(val));
+        }
         return;
     }
 }
+
+/// Flat `key = value` pairs of one TOML inline table (single level, no
+/// nesting): strings unquoted, arrays/bools/integers kept verbatim for the
+/// typed per-key parsers. Mirrors `coder = {...}` / `env = {...}` forms.
+std::map<std::string, std::string> parse_inline_table(const std::string& text);
 
 Partial parse_toml_text(const std::string& text, const std::string& path_for_errors) {
     Partial p;
@@ -238,14 +346,27 @@ Partial parse_toml_text(const std::string& text, const std::string& path_for_err
             std::string name = trim(t.substr(1, t.size() - 2));
             if (name == "monitoring") section = "monitoring";
             else if (name == "orchestration") section = "orchestration";
+            else if (name == "orchestration.specialists")
+                section = "specialists_bare"; // `coder = {...}` inline rows
             else if (name.rfind("orchestration.specialists.", 0) == 0) {
                 section = "specialist";
                 cur_specialist = name.substr(std::string("orchestration.specialists.").size());
                 if (cur_specialist.empty()) fail("empty specialist name");
             } else if (name.rfind("mcp_servers.", 0) == 0) {
-                section = "mcp";
-                cur_mcp = name.substr(12);
-                if (cur_mcp.empty()) fail("empty mcp server name");
+                std::string rest = name.substr(12);
+                auto dot = rest.find('.');
+                if (dot != std::string::npos && rest.substr(dot + 1) == "env") {
+                    // [mcp_servers.<name>.env] subsection.
+                    section = "mcp_env";
+                    cur_mcp = rest.substr(0, dot);
+                    if (cur_mcp.empty()) fail("empty mcp server name");
+                } else if (dot != std::string::npos) {
+                    section = "unknown"; // deeper nesting unsupported in v0.1 subset
+                } else {
+                    section = "mcp";
+                    cur_mcp = rest;
+                    if (cur_mcp.empty()) fail("empty mcp server name");
+                }
             } else {
                 section = "unknown";
             }
@@ -307,7 +428,7 @@ Partial parse_toml_text(const std::string& text, const std::string& path_for_err
 
 Config merge(Config base, const Partial& q) {
     if (q.backend_url && !q.backend_url->empty()) base.backend_url = *q.backend_url;
-    if (q.auth_token) base.auth_token = *q.auth_token;
+    if (q.auth_token && !q.auth_token->empty()) base.auth_token = *q.auth_token;
     if (q.model && !q.model->empty()) base.model = *q.model;
     if (q.temperature) base.temperature = static_cast<float>(*q.temperature);
     if (q.top_p) base.top_p = static_cast<float>(*q.top_p);
@@ -331,7 +452,8 @@ Config merge(Config base, const Partial& q) {
     }
     if (q.max_recursion_depth)
         base.orchestration.max_recursion_depth = static_cast<std::size_t>(*q.max_recursion_depth);
-    if (q.manager_module) base.orchestration.manager_module = *q.manager_module;
+    if (q.manager_module && !q.manager_module->empty())
+        base.orchestration.manager_module = *q.manager_module;
     for (auto& [k, v] : q.specialists) base.orchestration.specialists[k] = v;
     for (auto& [k, v] : q.mcp_servers) base.mcp_servers[k] = v;
     return base;
@@ -374,16 +496,21 @@ Config load(const std::optional<std::string>& explicit_path) {
         ss << f.rdbuf();
         cfg = merge(cfg, parse_toml_text(ss.str(), *p));
     }
-    if (const char* t = std::getenv("MARMEL_AUTH_TOKEN")) {
-        if (*t) cfg.auth_token = t;
+    auto trim_empty = [](const char* s) {
+        while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+        return *s == '\0';
+    };
+    if (cfg.auth_token.empty()) {
+        if (const char* t = std::getenv("MARMEL_AUTH_TOKEN")) cfg.auth_token = t;
     }
     if (const char* u = std::getenv("MARMEL_BACKEND_URL")) {
-        if (*u) cfg.backend_url = u;
+        if (!trim_empty(u)) cfg.backend_url = u;
     }
     if (const char* m = std::getenv("MARMEL_MODEL")) {
-        if (*m) cfg.model = m;
+        if (!trim_empty(m)) cfg.model = m;
     }
-    if (!cfg.system_prompt_path.empty()) cfg.system_prompt_path = expand_path(cfg.system_prompt_path);
+    if (!cfg.system_prompt_path.empty())
+        cfg.system_prompt_path = expand_path(cfg.system_prompt_path, home_dir());
     return cfg;
 }
 

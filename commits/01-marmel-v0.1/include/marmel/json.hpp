@@ -58,6 +58,35 @@ public:
     bool is_null() const { return type_ == Type::Null; }
     bool is_bool() const { return type_ == Type::Bool; }
     bool is_number() const { return type_ == Type::Number; }
+
+    /// Raw source token when parsed (e.g. "100", "1e3"); empty when
+    /// constructed programmatically. Enables exact serde as_u64 semantics.
+    const std::string& number_raw() const { return number_raw_; }
+    bool is_integer() const {
+        if (type_ != Type::Number) return false;
+        if (!number_raw_.empty()) {
+            if (number_raw_.empty() || number_raw_[0] == '-' || number_raw_[0] == '+')
+                return false;
+            for (char c : number_raw_)
+                if (c < '0' || c > '9') return false;
+            return !number_raw_.empty();
+        }
+        double d = number_;
+        return d >= 0 && d == static_cast<long long>(d);
+    }
+    unsigned long long as_u64(unsigned long long fallback = 0) const {
+        if (!is_integer()) return fallback;
+        if (!number_raw_.empty()) {
+            try {
+                std::size_t n = 0;
+                unsigned long long u = std::stoull(number_raw_, &n);
+                if (n == number_raw_.size()) return u;
+            } catch (...) {
+            }
+            return fallback;
+        }
+        return static_cast<unsigned long long>(number_);
+    }
     bool is_string() const { return type_ == Type::String; }
     bool is_array() const { return type_ == Type::Array; }
     bool is_object() const { return type_ == Type::Object; }
@@ -313,7 +342,9 @@ private:
                 while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos]))) pos++;
             }
             try {
-                return Json(std::stod(std::string(s.substr(start, pos - start))));
+                Json v(std::stod(std::string(s.substr(start, pos - start))));
+                v.number_raw_ = std::string(s.substr(start, pos - start));
+                return v;
             } catch (...) {
                 throw JsonParseError("Json: bad number");
             }
@@ -434,6 +465,7 @@ private:
     Type type_;
     bool bool_;
     double number_;
+    std::string number_raw_;
     std::string string_;
     std::shared_ptr<Array> array_;
     std::shared_ptr<Object> object_;

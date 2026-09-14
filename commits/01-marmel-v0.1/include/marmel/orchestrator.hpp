@@ -194,6 +194,8 @@ private:
     bool in_response_field_ = false;
     bool finished_ = false;
     bool escaping_ = false;
+    bool unicode_active_ = false;
+    std::string unicode_buf_;
 };
 
 SteerOutcome resolve_steer_outcome(std::optional<SteerDecision> decision, bool has_active);
@@ -203,6 +205,11 @@ std::optional<SteerDecision> parse_steer_json(const std::string& text);
 std::optional<SteerDecision> arbitrate_steer_context_stream(
     const llm::ChatClient& client, std::shared_ptr<harness::HarnessStats> stats,
     const SteerContext& ctx, const std::function<void(const std::string&)>& on_delta);
+std::optional<SteerDecision> arbitrate_steer_stream(
+    const llm::ChatClient& client, std::shared_ptr<harness::HarnessStats> stats,
+    const std::string& main_goal, const std::string& plan_content,
+    const std::string& active_subtask, const std::string& user_message,
+    const std::function<void(const std::string&)>& on_delta);
 std::optional<SteerDecision> arbitrate_steer(const llm::ChatClient& client,
                                             std::shared_ptr<harness::HarnessStats> stats,
                                             const std::string& main_goal,
@@ -211,17 +218,35 @@ std::optional<SteerDecision> arbitrate_steer(const llm::ChatClient& client,
                                             const std::string& user_message);
 SteerOutcome arbitrate_steer_stream_with_fallback(
     const llm::ChatClient& client, std::shared_ptr<harness::HarnessStats> stats,
-    const SteerContext& ctx, bool has_active,
+    const std::string& main_goal, const std::string& plan_content,
+    const std::string& active_subtask, const std::string& user_message, bool has_active,
     const std::function<void(const std::string&)>& on_delta = {});
-
-/// Null-client variant used when no backend is configured: falls back per §5.3.
-SteerOutcome arbitrate_steer_with_fallback(const std::string& user_message, bool has_active);
+/// Unavailable-arbitrator fallback (§5.3) with the standard signature.
+SteerOutcome arbitrate_steer_with_fallback(const llm::ChatClient& client,
+                                          std::shared_ptr<harness::HarnessStats> stats,
+                                          const std::string& main_goal,
+                                          const std::string& plan_content,
+                                          const std::string& active_subtask,
+                                          const std::string& user_message, bool has_active);
 
 // --- Manager ------------------------------------------------------------------
 
 struct OrchestrationConfigView {
     std::size_t max_recursion_depth = kDefaultMaxRecursionDepth;
     std::string manager_module;
+    /// Per-role tool allowlists from config (name → tools). Built by
+    /// from_config (0→3, empty→"src/orchestrator/mod.rs"); runtime routing
+    /// still resolves through the canonical registry (as in Rust).
+    std::map<std::string, std::vector<std::string>> specialists;
+};
+
+/// A single delegation routed to a worker (pub API; the Silent Dispatcher
+/// tracks in-flight/returned subtasks through these).
+struct Delegation {
+    agents::Agent agent = agents::Agent::Generalist;
+    agents::DelegationRequest request;
+    RecursionDepth depth;
+    std::optional<agents::Deliverable> result;
 };
 
 class OrchestratorManager {
@@ -234,6 +259,7 @@ public:
 
     void guard_no_domain_work() const;
     void create_plan(const std::string& markdown) const;
+    void abort(); // user-initiated halt hook (no-op counter-wise, as in Rust)
     agents::Deliverable delegate(const agents::DelegationRequest& req);
     std::optional<agents::Deliverable> recover_frozen();
     std::vector<agents::Deliverable> run_executing(

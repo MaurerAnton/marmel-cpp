@@ -123,6 +123,7 @@ public:
     std::optional<std::string> read_input() override { return std::nullopt; }
     void request_abort() override { aborted_ = true; }
     bool aborted() const override { return aborted_; }
+    void clear_abort() override { aborted_ = false; }
     void shutdown() override { flush(); }
 
 private:
@@ -148,10 +149,7 @@ public:
     std::optional<std::string> read_input() override;
     void request_abort() override { aborted_ = true; }
     bool aborted() const override { return aborted_; }
-    void clear_abort() override {
-        aborted_ = false;
-        confirm_abort_ = false;
-    }
+    void clear_abort() override { aborted_ = false; }
     void shutdown() override;
     void set_subagents(const std::vector<SubagentDetail>& subs) override { subagents_ = subs; }
 

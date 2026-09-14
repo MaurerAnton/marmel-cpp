@@ -60,21 +60,16 @@ std::size_t next_char(const std::string& s, std::size_t byte) {
 }
 
 std::string load_system_prompt(const config::Config& cfg) {
-    std::string base;
-    {
-        std::ifstream f(cfg.system_prompt_path, std::ios::binary);
-        if (f) {
-            std::ostringstream ss;
-            ss << f.rdbuf();
-            base = ss.str();
-        } else {
-            base = std::string(prompts::SYSTEM_PROMPT);
-        }
-    }
+    // NOTE: upstream ignores the configured path and always embeds
+    // prompts/system.md (include_str!), with this exact footer.
+    (void)cfg;
+    std::string base = std::string(prompts::SYSTEM_PROMPT);
     std::error_code ec;
     std::string cwd = std::filesystem::current_path(ec).string();
     if (ec) cwd = ".";
-    return base + "\n\n## Environment & Workspace\nCWD: " + cwd;
+    return base + "\n\n## Workspace & Environment\n- Current Working Directory: `" + cwd +
+           "`\n- All tool executions, relative file paths, commands, and search operations resolve "
+           "against this workspace directory.\n";
 }
 
 std::string classify_llm_error(const std::string& e) {
@@ -103,25 +98,25 @@ void handle_reset_command(const agent::Plan& plan, Renderer& renderer, agent::Co
         "Conversational phase."));
 }
 
-std::string subagent_key(const std::string& agent, const std::optional<std::string>& task) {
-    return task && !task->empty() ? agent + "-" + *task : agent;
-}
-
 void update_subagent_lifecycle(std::vector<SubagentDetail>& subs, agents::Agent agent,
                                std::optional<std::string> task, std::optional<std::string> prompt,
                                bool started) {
     std::string name = agents::agent_to_string(agent);
-    std::string key = subagent_key(name, task);
+    if (task && !trim_copy(*task).empty()) name += "-" + *task;
+    std::string task_str = task.value_or("");
+    std::string log_entry =
+        (started ? "started task " : "completed task ") + task_str;
     for (auto& s : subs) {
-        if (subagent_key(s.name, s.task_id) == key) {
+        if (s.name == name) {
             s.is_active = started;
-            if (prompt) s.prompt = *prompt;
             if (started) {
+                s.task_id = task;
+                if (prompt) s.prompt = *prompt;
                 s.started_at = std::chrono::steady_clock::now();
-                s.logs.push_back("started task " + task.value_or("(no task id)"));
             } else {
-                s.logs.push_back("completed task " + task.value_or("(no task id)"));
+                s.started_at.reset();
             }
+            s.logs.push_back(log_entry);
             return;
         }
     }
@@ -131,22 +126,26 @@ void update_subagent_lifecycle(std::vector<SubagentDetail>& subs, agents::Agent 
     d.prompt = prompt.value_or("");
     d.is_active = started;
     if (started) d.started_at = std::chrono::steady_clock::now();
-    d.logs.push_back((started ? "started task " : "completed task ") + task.value_or("(no task id)"));
+    d.logs.push_back(log_entry);
     subs.push_back(std::move(d));
 }
 
 void drain_delegation_events(orchestrator::OrchestratorManager* manager, Renderer& renderer,
                              std::vector<SubagentDetail>& subs) {
     if (!manager) return;
-    for (auto& ev : manager->delegation_events()) {
-        renderer.on_event(UiEvent::delegation_ev(ev));
+    bool changed = false;
+    // NOTE: take a snapshot — manager events are drained via clear after.
+    std::vector<orchestrator::DelegationEvent> events = manager->delegation_events();
+    for (auto& ev : events) {
         if (ev.kind == orchestrator::DelegationEvent::Kind::Started)
             update_subagent_lifecycle(subs, ev.agent, ev.task, std::nullopt, true);
         else
             update_subagent_lifecycle(subs, ev.agent, ev.task, std::nullopt, false);
+        changed = true;
+        renderer.on_event(UiEvent::delegation_ev(ev));
     }
     manager->clear_delegation_events();
-    renderer.set_subagents(subs);
+    if (changed) renderer.set_subagents(subs);
 }
 
 void drain_status_queue(Renderer& renderer) {
@@ -157,33 +156,29 @@ void drain_status_queue(Renderer& renderer) {
 void apply_steer_outcome(const orchestrator::SteerOutcome& outcome, const std::string& user_msg,
                          Renderer& renderer, agent::ContextEngine& ctx,
                          std::vector<std::string>& steer_queue) {
+    (void)ctx;
     using Kind = orchestrator::SteerOutcome::Kind;
-    if (outcome.kind == Kind::Decided && outcome.decision) {
-        const auto& d = *outcome.decision;
-        if (d.decision == "RespondDirectly") {
-            renderer.on_event(UiEvent::status(d.response.value_or("(no response)")));
-        } else if (d.decision == "AbortImmediately") {
-            renderer.request_abort();
-            ctx.append(types::Message::user(user_msg));
-        } else if (d.decision == "QueueAndContinue" || d.decision == "ForwardToWorker") {
-            steer_queue.push_back(user_msg);
-            renderer.on_event(UiEvent::status(d.response.value_or("steering queued")));
-        } else if (d.decision == "ApprovePlan") {
-            ctx.append(types::Message::user("User approved plan."));
-        } else if (d.decision == "RejectPlan") {
-            renderer.request_abort();
-            ctx.append(types::Message::user("User rejected plan: " + d.response.value_or("")));
-        } else {
-            if (d.response && !d.response->empty())
-                ctx.append(types::Message::user(user_msg + "\n" + *d.response));
-            else
-                ctx.append(types::Message::user(user_msg));
-        }
-    } else if (outcome.kind == Kind::QueueInstruction) {
+    std::string decision;
+    if (outcome.kind == Kind::Decided && outcome.decision) decision = outcome.decision->decision;
+    if (decision == "RespondDirectly") {
+        renderer.on_event(UiEvent::status("Answered via direct steer response"));
+        renderer.flush();
+    } else if (decision == "AbortImmediately") {
+        renderer.request_abort();
         steer_queue.push_back(user_msg);
-        renderer.on_event(UiEvent::status("steering queued behind active work"));
+    } else if (decision == "ForwardToWorker") {
+        steer_queue.push_back(user_msg);
+        renderer.on_event(UiEvent::status("Notice forwarded to specialist"));
+        renderer.flush();
+    } else if (decision == "ApprovePlan") {
+        steer_queue.push_back("User approved plan.");
+    } else if (decision == "RejectPlan") {
+        renderer.request_abort();
+        steer_queue.push_back("User rejected plan: " + user_msg);
     } else {
-        ctx.append(types::Message::user(user_msg));
+        steer_queue.push_back(user_msg);
+        renderer.on_event(UiEvent::status("Instruction queued for next turn"));
+        renderer.flush();
     }
 }
 
@@ -193,19 +188,14 @@ orchestrator::SteerOutcome arbitrate_line(const llm::ChatClient& client,
                                           const std::string& user_msg) {
     std::string plan_content;
     if (auto c = agent::Plan::default_plan().read()) plan_content = *c;
-    orchestrator::SteerContext ctx;
-    ctx.main_goal = goal;
-    ctx.orchestrator_status = "executing";
-    ctx.plan_content = plan_content;
-    ctx.plan_progress = orchestrator::generate_plan_progress_summary(plan_content);
-    ctx.user_message = user_msg;
-    ctx.active_subtasks = orchestrator::get_active_subtasks_str();
     bool has_active = orchestrator::has_active_workers();
     if (client.backend_url().empty())
         return orchestrator::resolve_steer_outcome(std::nullopt, has_active);
-    auto decision =
-        orchestrator::arbitrate_steer_context_stream(client, stats, ctx, {});
-    return orchestrator::resolve_steer_outcome(std::move(decision), has_active);
+    // Synchronous turn-boundary substitute for the background arbitration
+    // task (no tokio runtime in the C++ port).
+    return orchestrator::arbitrate_steer_with_fallback(
+        client, stats, goal, plan_content, orchestrator::get_active_subtasks_str(), user_msg,
+        has_active);
 }
 
 // RendererSink: bridges llm StreamSink events to Renderer events.
@@ -228,14 +218,25 @@ struct RendererSink final : public llm::StreamSink {
     }
     bool is_aborted() override {
         renderer.flush();
-        drain_status_queue(renderer);
-        while (auto input = renderer.poll_input()) {
+        // NOTE: no arb-channel drain here (sync port — arbitration happens at
+        // turn boundaries via arbitrate_line).
+        if (auto input = renderer.poll_input()) {
             if (is_abort_command(*input)) {
                 renderer.request_abort();
-                return true;
+            } else if (is_reset_command(*input)) {
+                try {
+                    agent::Plan::default_plan().clear();
+                } catch (...) {
+                }
+                renderer.on_event(
+                    UiEvent::message("Execution plan has been cleared and reset by user."));
+                renderer.on_event(UiEvent::status("Execution plan reset"));
+                renderer.flush();
+            } else if (!trim_copy(*input).empty()) {
+                // Sync substitute for spawn_steer_arbitration (no runtime):
+                // queue for turn-boundary arbitration.
+                steer_queue.push_back(*input);
             }
-            if (is_reset_command(*input)) continue; // handled at turn boundary
-            if (!trim_copy(*input).empty()) steer_queue.push_back(*input);
         }
         return renderer.aborted();
     }
@@ -245,31 +246,48 @@ struct RendererSink final : public llm::StreamSink {
 
 std::string format_active_subtasks(const std::vector<SubagentDetail>& subs) {
     std::string global = orchestrator::get_active_subtasks_str();
-    if (global != "No active subtasks." && !trim_copy(global).empty()) return global;
+    if (global != "None" && !trim_copy(global).empty()) return global;
     std::string out;
+    bool any = false;
     for (auto& s : subs) {
         if (!s.is_active) continue;
-        if (!out.empty()) out += "\n";
-        out += "- " + s.name;
-        if (s.task_id) out += " on " + *s.task_id;
+        any = true;
+        long long secs = 0;
+        if (s.started_at)
+            secs = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::steady_clock::now() - *s.started_at)
+                       .count();
+        std::string task_id_str = s.task_id.value_or(s.name);
+        std::string prompt_str = s.prompt.empty() ? "None" : s.prompt;
+        out += "- Tool Call ID: " + task_id_str + "\n  Subagent: " + s.name +
+               "\n  Task Prompt: " + prompt_str + "\n  Running For: " + std::to_string(secs) +
+               " seconds\n\n";
     }
-    return out.empty() ? "No active subtasks." : out;
+    if (!any) return "None";
+    return out;
 }
 std::string format_plan_progress_summary(const std::string& plan_content) {
     return orchestrator::generate_plan_progress_summary(plan_content);
 }
 
 std::vector<std::string> chunk_utf8(const std::string& s, std::size_t max_bytes) {
+    // Exact port: "" → []; back off to boundary; single-char fallback (never
+    // splits UTF-8, never indexes out of bounds).
     std::vector<std::string> out;
-    std::size_t i = 0;
-    while (i < s.size()) {
-        std::size_t j = std::min(i + max_bytes, s.size());
-        while (j > i && is_cont(static_cast<unsigned char>(s[j]))) j--;
-        if (j == i) j = std::min(i + max_bytes, s.size());
-        out.push_back(s.substr(i, j - i));
-        i = j;
+    std::size_t start = 0;
+    auto is_boundary = [](const std::string& t, std::size_t i) {
+        return i == 0 || i >= t.size() || !is_cont(static_cast<unsigned char>(t[i]));
+    };
+    while (start < s.size()) {
+        std::size_t end = std::min(start + max_bytes, s.size());
+        while (end > start && !is_boundary(s, end)) end--;
+        if (end == start) {
+            end = start + 1;
+            while (end < s.size() && !is_boundary(s, end)) end++;
+        }
+        out.push_back(s.substr(start, end - start));
+        start = end;
     }
-    if (out.empty()) out.emplace_back("");
     return out;
 }
 
@@ -306,42 +324,43 @@ int run_session_with_chat(const config::Config& cfg, Renderer& renderer,
     agent::ContextEngineFactory factory(cfg.max_context_tokens);
     agent::ContextEngine ctx = factory.manager_context("", "");
 
-    // Goal acquisition.
+    // Goal acquisition: `initial` used verbatim (even empty); abort/None →
+    // shutdown + return WITHOUT Done (as in Rust).
     std::string goal;
-    if (initial && !trim_copy(*initial).empty()) {
+    if (initial) {
         goal = *initial;
     } else {
-        while (true) {
+        bool acquired = false;
+        while (!acquired) {
             auto line = renderer.read_input();
             if (!line || is_abort_command(*line)) {
-                renderer.on_event(UiEvent::done());
                 renderer.shutdown();
                 return 0;
             }
             if (is_reset_command(*line)) {
-                try {
-                    agent::Plan::default_plan().clear();
-                } catch (...) {
-                }
+                handle_reset_command(agent::Plan::default_plan(), renderer, ctx);
                 continue;
             }
             if (trim_copy(*line).empty()) continue;
             goal = *line;
-            break;
+            acquired = true;
         }
     }
     ctx.set_system_prompt(load_system_prompt(cfg));
     ctx.set_goal(goal);
 
-    // Deep-Freeze recovery.
-    try {
-        if (auto rec = manager->recover_frozen()) {
-            renderer.on_event(UiEvent::status("[Recovered task " +
-                                              rec->task_id.value_or("(no task)") + "]"));
-            ctx.append(types::Message::assistant(rec->content, std::nullopt, {}));
+    // Deep-Freeze recovery: ToolResult event, no transcript append; errors
+    // swallowed (if-let-Ok-Some only, as in Rust).
+    if (manager) {
+        try {
+            if (auto rec = manager->recover_frozen()) {
+                std::string task_info = rec->task_id.value_or("recovered");
+                renderer.on_event(UiEvent::tool_result("[Recovered task " + task_info + "] " +
+                                                       rec->content));
+                renderer.flush();
+            }
+        } catch (...) {
         }
-    } catch (const std::exception& e) {
-        renderer.on_event(UiEvent::status(std::string("recovery failed: ") + e.what()));
     }
 
     llm::StreamConfig stream_cfg = llm::StreamConfig::from_config(cfg);
@@ -415,6 +434,39 @@ int run_session_with_chat(const config::Config& cfg, Renderer& renderer,
                 }
             }
             agent::ToolCaller caller = agent::ToolCaller::manager();
+            // Pump helper: join one worker while draining status/delegation,
+            // polling input (abort/reset/steer) every 20 ms. Returns nullopt
+            // on abort, mirroring Err(Execution("aborted")).
+            auto await_handle = [&](std::future<std::pair<std::string, std::string>>& h)
+                -> std::optional<std::pair<std::string, std::string>> {
+                while (h.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
+                    drain_status_queue(renderer);
+                    renderer.flush();
+                    drain_delegation_events(manager.get(), renderer, subagents);
+                    if (auto input = renderer.poll_input()) {
+                        if (is_abort_command(*input)) {
+                            renderer.request_abort();
+                        } else if (is_reset_command(*input)) {
+                            try {
+                                agent::Plan::default_plan().clear();
+                            } catch (...) {
+                            }
+                            renderer.on_event(UiEvent::message(
+                                "Execution plan has been cleared and reset by user."));
+                            renderer.on_event(UiEvent::status("Execution plan reset"));
+                            renderer.flush();
+                        } else if (!trim_copy(*input).empty()) {
+                            steer_queue.push_back(*input);
+                        }
+                    }
+                    if (renderer.aborted()) return std::nullopt;
+                }
+                try {
+                    return h.get();
+                } catch (...) {
+                    return std::nullopt;
+                }
+            };
             auto run_one = [&](const types::ToolCall& c) {
                 Json args = Json::parse_or_string(c.arguments);
                 if (!args.is_object()) args = Json::object();
@@ -453,26 +505,66 @@ int run_session_with_chat(const config::Config& cfg, Renderer& renderer,
                 return std::make_pair(c.id, content);
             };
             if (all_parallel) {
+                // Submission order (as in Rust `for handle in handles`), each
+                // pumped; aborts record "ERROR: aborted" per pending call.
                 std::vector<std::future<std::pair<std::string, std::string>>> handles;
                 for (auto& c : tool_calls)
                     handles.push_back(std::async(std::launch::async, run_one, c));
                 for (auto& h : handles) {
-                    auto [call_id, content] = h.get();
-                    ctx.append(types::Message::tool(call_id, content));
+                    if (renderer.aborted()) {
+                        ctx.append(types::Message::tool("", "ERROR: aborted"));
+                        continue;
+                    }
+                    auto res = await_handle(h);
+                    if (!res) {
+                        ctx.append(types::Message::tool("", "ERROR: aborted"));
+                        continue;
+                    }
+                    ctx.append(types::Message::tool(res->first, res->second));
                 }
             } else {
                 for (auto& c : tool_calls) {
                     if (renderer.aborted()) break;
-                    auto [call_id, content] = run_one(c);
-                    ctx.append(types::Message::tool(call_id, content));
+                    // Sequential path pumps the single worker identically.
+                    std::future<std::pair<std::string, std::string>> h =
+                        std::async(std::launch::async, run_one, c);
+                    auto res = await_handle(h);
+                    if (!res) {
+                        // Empty call id (Rust breaks with String::new()).
+                        ctx.append(types::Message::tool("", "ERROR: aborted"));
+                        break;
+                    }
+                    ctx.append(types::Message::tool(res->first, res->second));
                     drain_status_queue(renderer);
                     drain_delegation_events(manager.get(), renderer, subagents);
                 }
             }
             renderer.flush();
             if (renderer.aborted()) break;
+            // Plan-complete notice: no more tools — deliver the final answer.
+            if (agent::Plan::default_plan().is_complete()) {
+                ctx.append(types::Message::user(
+                    "(SYSTEM NOTICE: All execution plan tasks are now COMPLETE [x]. Do NOT execute "
+                    "any more tools or re-delegate. Deliver your comprehensive final "
+                    "answer/synthesis to the user now.)"));
+            }
         }
         if (!keep_going) break;
+
+        if (renderer.aborted()) {
+            if (!steer_queue.empty()) {
+                // Steer arbitrator requested AbortImmediately: redirect.
+                renderer.clear_abort();
+                for (auto& s : steer_queue) ctx.append(types::Message::user(s));
+                steer_queue.clear();
+                renderer.on_event(UiEvent::status(
+                    "Steering redirection: aborted current turn, starting next turn with updated "
+                    "context"));
+                renderer.flush();
+                continue;
+            }
+            break;
+        }
 
         if (!steer_queue.empty()) {
             // Arbitrate queued steering before blocking for the next goal.
@@ -499,10 +591,6 @@ int run_session_with_chat(const config::Config& cfg, Renderer& renderer,
             handle_reset_command(agent::Plan::default_plan(), renderer, ctx);
             continue;
         }
-        if (is_thought_command(*line) || is_help_command(*line)) {
-            renderer.on_event(UiEvent::status(*line));
-            continue;
-        }
         if (!trim_copy(*line).empty()) ctx.append(types::Message::user(*line));
     }
 
@@ -519,6 +607,11 @@ int run_session(const config::Config& cfg, Renderer& renderer, std::optional<std
 
 // --- raw ----------------------------------------------------------------------------------
 void RawRenderer::push_line(const std::string& label, const std::string& text) {
+    // NOTE: Done emits exactly "[done]\n" (no trailing space after label).
+    if (label == "done") {
+        buffer_ += "[done]\n";
+        return;
+    }
     for (auto& chunk : chunk_utf8(text, 512)) buffer_ += "[" + label + "] " + chunk + "\n";
 }
 void RawRenderer::on_event(const UiEvent& ev) {
@@ -784,7 +877,7 @@ void TuiRenderer::draw() {
     std::string active;
     {
         std::string a = format_active_subtasks(subagents_);
-        if (a != "No active subtasks.") active = " [" + std::to_string(subagents_.size()) + " agents]";
+        if (a != "None") active = " [" + std::to_string(subagents_.size()) + " agents]";
     }
     std::cout << "Session: local | Status: " + status_line_ + active << "\n";
     std::cout << "> " << input_text_ << "\n" << std::flush;

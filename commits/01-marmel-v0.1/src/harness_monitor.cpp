@@ -8,18 +8,13 @@
 namespace marmel::harness {
 namespace {
 
-std::string bare_name(const std::string& name) {
-    constexpr char kPrefix[] = "terminal__";
-    if (name.rfind(kPrefix, 0) == 0) return name.substr(sizeof(kPrefix) - 1);
-    return name;
-}
-
 bool is_pagination_tool(const std::string& name) {
-    std::string b = bare_name(name);
-    return b == "read_file" || b == "grep_search";
+    // Exact base names only (no terminal__ stripping — matches Rust).
+    return name == "read_file" || name == "grep_search";
 }
 
 // Recursively drop `offset`/`page` keys (all objects, incl. nested/arrays).
+// Used by the ToolCallRecord semantic comparisons (strip_pagination).
 Json strip_pagination(const Json& v) {
     if (v.is_object()) {
         Json::Object o;
@@ -61,13 +56,42 @@ std::string trim_ws(const std::string& s) {
 }
 
 // --- XML rescue internals ------------------------------------------------------
+// Mirrors monitor.rs find_next_tool_call_block / parse_tool_call_block /
+// try_embedded_json / try_function_attr / try_legacy_function_block /
+// extract_inner_text / extract_attribute / make_rescued_call exactly
+// (including literal `<function=`/`<parameter=` matching and Null→"null").
 struct ParsedBlock {
     std::string name;
     std::string args_str; // JSON dump or raw string
 };
 
-std::optional<ParsedBlock> try_embedded_json(const std::string& inner) {
-    std::string t = trim_ws(inner);
+std::string extract_inner_text(const std::string& block) {
+    auto gt = block.find('>');
+    std::size_t open_end = (gt == std::string::npos) ? 0 : gt + 1;
+    auto close = block.find("</tool_call>");
+    if (close == std::string::npos || close < open_end) return block.substr(open_end);
+    return block.substr(open_end, close - open_end);
+}
+
+std::optional<std::string> extract_attribute(const std::string& block, const std::string& attr) {
+    std::string needle = attr + "=";
+    auto idx = block.find(needle);
+    if (idx == std::string::npos) return std::nullopt;
+    std::string after = trim_ws(block.substr(idx + needle.size()));
+    if (!after.empty() && after.front() == '"') {
+        auto end = after.find('"', 1);
+        if (end == std::string::npos) return std::nullopt;
+        return after.substr(1, end - 1);
+    }
+    std::size_t end = 0;
+    while (end < after.size() && after[end] != '>' && !std::isspace(static_cast<unsigned char>(after[end])))
+        end++;
+    if (end == 0) return std::nullopt;
+    return after.substr(0, end);
+}
+
+std::optional<ParsedBlock> try_embedded_json(const std::string& block) {
+    std::string t = trim_ws(extract_inner_text(block));
     if (t.empty() || t.front() != '{') return std::nullopt;
     Json v;
     try {
@@ -88,18 +112,16 @@ std::optional<ParsedBlock> try_embedded_json(const std::string& inner) {
     if (args.is_string())
         args_str = args.as_string();
     else if (args.is_null())
-        args_str = "{}";
+        args_str = "null";
     else
         args_str = args.dump();
     return ParsedBlock{name, args_str};
 }
 
-std::optional<ParsedBlock> try_function_attr(const std::string& open_tag, const std::string& inner) {
-    static const std::regex re(R"re(function\s*=\s*"?([^"\s>]+)"?)re");
-    std::smatch m;
-    if (!std::regex_search(open_tag, m, re)) return std::nullopt;
-    std::string name = m[1].str();
-    std::string body = trim_ws(inner);
+std::optional<ParsedBlock> try_function_attr(const std::string& block) {
+    auto name = extract_attribute(block, "function");
+    if (!name) return std::nullopt;
+    std::string body = trim_ws(extract_inner_text(block));
     std::string args_str;
     try {
         Json v = Json::parse(body);
@@ -110,32 +132,49 @@ std::optional<ParsedBlock> try_function_attr(const std::string& open_tag, const 
     } catch (...) {
         args_str = body;
     }
-    return ParsedBlock{name, args_str};
+    return ParsedBlock{*name, args_str};
 }
 
-std::optional<ParsedBlock> try_legacy_function_block(const std::string& inner) {
-    static const std::regex fn_re(R"(<function\s*=\s*([^>]+)>)");
-    std::smatch m;
-    if (!std::regex_search(inner, m, fn_re)) return std::nullopt;
-    std::string name = trim_ws(m[1].str());
-    static const std::regex param_re(
-        R"re(<parameter(?:\s+name)?\s*=\s*"?([^">]+)"?\s*>(.*?)</parameter>)re");
+std::optional<ParsedBlock> try_legacy_function_block(const std::string& block) {
+    static const std::string kFuncOpen = "<function=";
+    auto fs = block.find(kFuncOpen);
+    if (fs == std::string::npos) return std::nullopt;
+    std::size_t name_start = fs + kFuncOpen.size();
+    auto gt_rel = block.substr(name_start).find('>');
+    if (gt_rel == std::string::npos) return std::nullopt;
+    std::string name = trim_ws(block.substr(name_start, gt_rel));
+    std::size_t body_start = name_start + gt_rel + 1;
+    static const std::string kClose = "</function>";
+    auto be_rel = block.substr(body_start).find(kClose);
+    if (be_rel == std::string::npos) return std::nullopt;
+    std::string body = block.substr(body_start, be_rel);
     Json::Object obj;
-    auto begin = std::sregex_iterator(inner.begin(), inner.end(), param_re);
-    auto end = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        obj.emplace(trim_ws((*it)[1].str()), Json((*it)[2].str()));
+    std::size_t cursor = 0;
+    static const std::string kParam = "<parameter=";
+    static const std::string kParamClose = "</parameter>";
+    while (true) {
+        auto rel = body.substr(cursor).find(kParam);
+        if (rel == std::string::npos) break;
+        std::size_t p_start = cursor + rel;
+        std::size_t key_start = p_start + kParam.size();
+        auto ke_rel = body.substr(key_start).find('>');
+        if (ke_rel == std::string::npos) break;
+        std::string key = trim_ws(body.substr(key_start, ke_rel));
+        std::size_t val_start = key_start + ke_rel + 1;
+        auto ve_rel = body.substr(val_start).find(kParamClose);
+        if (ve_rel != std::string::npos) {
+            obj.emplace(key, Json(trim_ws(body.substr(val_start, ve_rel))));
+        }
+        cursor = val_start;
     }
-    if (!obj.empty()) return ParsedBlock{name, Json(std::move(obj)).dump()};
-    // Raw body string: text between the first '>' and </function>.
-    auto gt = inner.find('>');
-    auto close = inner.rfind("</function>");
-    std::string body;
-    if (gt != std::string::npos && close != std::string::npos && close > gt)
-        body = trim_ws(inner.substr(gt + 1, close - gt - 1));
-    else
-        body = trim_ws(inner);
-    return ParsedBlock{name, body};
+    if (obj.empty()) return ParsedBlock{name, trim_ws(body)};
+    return ParsedBlock{name, Json(std::move(obj)).dump()};
+}
+
+std::optional<ParsedBlock> parse_tool_call_block(const std::string& block) {
+    if (auto p = try_embedded_json(block)) return p;
+    if (auto p = try_function_attr(block)) return p;
+    return try_legacy_function_block(block);
 }
 
 } // namespace
@@ -156,11 +195,20 @@ bool ToolCallRecord::same_operation(const ToolCallRecord& o) const {
     return arguments == o.arguments;
 }
 bool semantic_json_eq(const std::string& a, const std::string& b) {
-    try {
-        return semantic_value_eq(Json::parse(a), Json::parse(b));
-    } catch (...) {
-        return a == b;
-    }
+    // Legacy helper: drops offset/page at the TOP level only.
+    auto norm = [](const std::string& s) {
+        try {
+            Json v = Json::parse(s);
+            if (v.is_object()) {
+                v.as_object().erase("offset");
+                v.as_object().erase("page");
+            }
+            return v;
+        } catch (...) {
+            return Json(s);
+        }
+    };
+    return norm(a) == norm(b);
 }
 
 // --- XmlToolRescue -----------------------------------------------------------------
@@ -171,60 +219,52 @@ void XmlToolRescue::set_stats(std::shared_ptr<HarnessStats> stats) { stats_ = st
 std::vector<types::ToolCall> XmlToolRescue::rescue(const std::string& text) const {
     std::vector<types::ToolCall> out;
     std::size_t from = 0;
+    static const std::string kCloseTag = "</tool_call>";
+    static const std::string kFuncClose = "</function>";
     while (from < text.size()) {
-        std::size_t open = text.find("<tool_call", from);
-        std::string open_tag, inner;
-        bool legacy = false;
-        std::size_t next_from = std::string::npos;
-        if (open != std::string::npos) {
-            std::size_t gt = text.find('>', open);
-            std::size_t close = text.find("</tool_call>", open);
-            if (gt != std::string::npos && close != std::string::npos && close > gt) {
-                open_tag = text.substr(open, gt - open + 1);
-                inner = text.substr(gt + 1, close - gt - 1);
-                next_from = close + std::string("</tool_call>").size();
-            } else {
-                break;
+        std::optional<std::pair<std::size_t, std::size_t>> range;
+        // Angle-bracket style first (no early break when malformed).
+        {
+            std::size_t open = text.find("<tool_call", from);
+            if (open != std::string::npos) {
+                std::size_t close = text.find(kCloseTag, open);
+                if (close != std::string::npos)
+                    range = std::make_pair(open, close + kCloseTag.size());
             }
-        } else {
-            // Legacy: `tool_call <function=...>...</function>`.
-            std::size_t tc = text.find("tool_call", from);
-            if (tc == std::string::npos) break;
-            std::size_t fn = text.find("<function=", tc);
-            if (fn == std::string::npos) break;
-            // Require only whitespace between "tool_call" and "<function=".
-            bool ws_only = true;
-            for (std::size_t i = tc + 9; i < fn; i++)
-                if (!std::isspace(static_cast<unsigned char>(text[i]))) ws_only = false;
-            if (!ws_only) {
-                from = fn + 1;
-                continue;
+        }
+        // Legacy SPEC style: `tool_call` + optional whitespace + `<function=`.
+        if (!range) {
+            std::size_t search = from;
+            while (true) {
+                std::size_t tc = text.find("tool_call", search);
+                if (tc == std::string::npos) break;
+                std::size_t after = tc + 9;
+                std::size_t ws = after;
+                while (ws < text.size() &&
+                       std::isspace(static_cast<unsigned char>(text[ws])))
+                    ws++;
+                if (text.compare(ws, 10, "<function=") == 0) {
+                    std::size_t close = text.find(kFuncClose, ws);
+                    if (close == std::string::npos) break;
+                    range = std::make_pair(tc, close + kFuncClose.size());
+                    break;
+                }
+                search = tc + 9;
             }
-            std::size_t close = text.find("</function>", fn);
-            if (close == std::string::npos) break;
-            open_tag = "";
-            inner = text.substr(fn, close - fn + std::string("</function>").size());
-            next_from = close + std::string("</function>").size();
-            legacy = true;
         }
-        std::optional<ParsedBlock> parsed;
-        if (!legacy) {
-            parsed = try_embedded_json(inner);
-            if (!parsed) parsed = try_function_attr(open_tag, inner);
-            if (!parsed) parsed = try_legacy_function_block(inner);
-        } else {
-            parsed = try_legacy_function_block(inner);
-            if (!parsed) parsed = try_embedded_json(inner);
+        if (!range) break;
+        std::string block = text.substr(range->first, range->second - range->first);
+        // Shared parse order for both block kinds: embedded > attr > legacy.
+        if (auto parsed = parse_tool_call_block(block)) {
+            if (!parsed->name.empty()) {
+                types::ToolCall tc;
+                tc.id = "call_text_" + types::generate_uuid_v4();
+                tc.name = parsed->name;
+                tc.arguments = parsed->args_str.empty() ? "{}" : parsed->args_str;
+                out.push_back(std::move(tc));
+            }
         }
-        if (parsed && !parsed->name.empty()) {
-            types::ToolCall tc;
-            tc.id = "call_text_" + types::generate_uuid_v4();
-            tc.name = parsed->name;
-            tc.arguments = parsed->args_str.empty() ? "{}" : parsed->args_str;
-            out.push_back(std::move(tc));
-        }
-        if (next_from == std::string::npos) break;
-        from = next_from;
+        from = range->second;
     }
     if (!out.empty() && stats_) stats_->record_xml_rescue();
     return out;
@@ -295,9 +335,46 @@ bool ToolRepetitionDetector::detect_cycle(const ToolCallRecord& rec) const {
 RepetitionDetector::RepetitionDetector(std::size_t threshold, std::size_t min_len)
     : threshold_(std::max<std::size_t>(2, threshold)), min_len_(std::max<std::size_t>(1, min_len)) {}
 void RepetitionDetector::push(const std::string& text) {
-    for (char c : text) {
-        buffer_.push_back(c);
+    // Decode UTF-8 into scalar values (invalid bytes → U+FFFD, one each).
+    for (std::size_t i = 0; i < text.size();) {
+        unsigned char c = text[i];
+        char32_t cp = 0xFFFD;
+        std::size_t len = 1;
+        if ((c & 0x80) == 0) {
+            cp = c;
+            len = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            cp = c & 0x1F;
+            len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            cp = c & 0x0F;
+            len = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            cp = c & 0x07;
+            len = 4;
+        }
+        bool ok = (c & 0x80) == 0;
+        if (!ok && i + len <= text.size()) {
+            ok = true;
+            cp = (len == 2)   ? (c & 0x1F)
+                 : (len == 3) ? (c & 0x0F)
+                              : (c & 0x07);
+            for (std::size_t k = 1; k < len; k++) {
+                unsigned char d = text[i + k];
+                if ((d & 0xC0) != 0x80) {
+                    ok = false;
+                    break;
+                }
+                cp = (cp << 6) | (d & 0x3F);
+            }
+        }
+        if (!ok) {
+            cp = 0xFFFD;
+            len = 1;
+        }
+        buffer_.push_back(cp);
         while (buffer_.size() > kTextBufferCapacity) buffer_.pop_front();
+        i += len;
     }
 }
 bool RepetitionDetector::is_repeating() const {
@@ -388,10 +465,8 @@ bool HarnessMonitor::feed_text(const std::string& chunk) {
     return false;
 }
 void HarnessMonitor::reset_text_break() {
+    // Only re-arms the flag (the text buffer is kept, as in Rust).
     repetition_fired_ = false;
-    if (threshold_ == 0) threshold_ = kDefaultRepetitionThreshold;
-    if (min_len_ == 0) min_len_ = kDefaultMinPatternLen;
-    text_rep_ = RepetitionDetector(threshold_, min_len_);
 }
 std::size_t HarnessMonitor::tool_buffer_len() const { return tool_rep_.len(); }
 

@@ -4,6 +4,7 @@
 
 #include "marmel/agent_context.hpp"
 #include "marmel/agents.hpp"
+#include "marmel/mcp.hpp"
 #include "marmel/orchestrator.hpp"
 
 #include <algorithm>
@@ -45,6 +46,42 @@ std::string to_upper(std::string s) {
 
 // --- UTF-8 helpers ---------------------------------------------------------------
 bool is_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
+/// Strict UTF-8 validation (Rust read_to_string semantics for grep/replace:
+/// invalid bytes reject the whole file).
+bool is_valid_utf8(const std::string& s) {
+    for (std::size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        std::size_t len = 0;
+        char32_t cp = 0;
+        if ((c & 0x80) == 0) {
+            i++;
+            continue;
+        } else if ((c & 0xE0) == 0xC0) {
+            len = 2;
+            cp = c & 0x1F;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+            cp = c & 0x0F;
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+            cp = c & 0x07;
+        } else {
+            return false;
+        }
+        if (i + len > s.size()) return false;
+        for (std::size_t k = 1; k < len; k++) {
+            unsigned char d = s[i + k];
+            if ((d & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (d & 0x3F);
+        }
+        // Reject overlongs, surrogates, out-of-range (strict).
+        if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000) ||
+            (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)
+            return false;
+        i += len;
+    }
+    return true;
+}
 std::string utf8_lossy(const std::string& bytes) {
     std::string out;
     for (std::size_t i = 0; i < bytes.size();) {
@@ -215,13 +252,23 @@ std::string req_str(const Json& args, const char* key, const char* tool,
 }
 
 /// Strict integer arg (read_file/grep): present-but-not-u64 throws.
+/// Mirrors serde as_u64 exactly via the raw number token (no float rounding).
 std::size_t req_usize(const Json& args, const char* key, std::size_t def, const char* tool) {
     if (!args.is_object() || !args.contains(key)) return def;
     const Json& v = args.at(key);
-    double d = v.as_double(-1.0);
-    if (!v.is_number() || d < 0 || d != static_cast<long long>(d))
+    auto bad = [&]() -> std::size_t {
         throw_hard(ToolError::bad_arguments(tool, std::string("field `") + key + "` must be an integer"));
-    return static_cast<std::size_t>(d);
+    };
+    if (!v.is_integer()) return bad();
+    try {
+        std::size_t n = 0;
+        unsigned long long u =
+            std::stoull(v.number_raw().empty() ? v.dump() : v.number_raw(), &n);
+        (void)n;
+        return static_cast<std::size_t>(u);
+    } catch (...) {
+        return bad();
+    }
 }
 
 /// Lenient integer arg (pty rows/cols/wait_ms): invalid values fall back to
@@ -229,9 +276,16 @@ std::size_t req_usize(const Json& args, const char* key, std::size_t def, const 
 std::size_t opt_u64(const Json& args, const char* key, std::size_t def) {
     if (!args.is_object() || !args.contains(key)) return def;
     const Json& v = args.at(key);
-    double d = v.as_double(-1.0);
-    if (!v.is_number() || d < 0 || d != static_cast<long long>(d)) return def;
-    return static_cast<std::size_t>(d);
+    if (!v.is_integer()) return def;
+    try {
+        std::size_t n = 0;
+        unsigned long long u =
+            std::stoull(v.number_raw().empty() ? v.dump() : v.number_raw(), &n);
+        (void)n;
+        return static_cast<std::size_t>(u);
+    } catch (...) {
+        return def;
+    }
 }
 
 std::string trim_sv(const std::string& s) {
@@ -283,6 +337,8 @@ ToolResult fs_replace(const Json& args) {
     std::ostringstream ss;
     ss << f.rdbuf();
     std::string content = ss.str();
+    if (!is_valid_utf8(content))
+        throw_hard(ToolError::execution("stream did not contain valid UTF-8"));
     std::size_t count = 0, pos = 0;
     if (!old_str.empty()) {
         while ((pos = content.find(old_str, pos)) != std::string::npos) {
@@ -353,10 +409,14 @@ ToolResult fs_write_file(const Json& args) {
 }
 
 // --- search.rs -----------------------------------------------------------------------------------
+// .gitignore handling (mirrors `ignore::WalkBuilder::require_git(false)`):
+// patterns are read from every visited directory's `.gitignore` (plus the
+// root's) and apply to that subtree; hidden entries (leading `.`) are
+// skipped like the crate's default filter.
 namespace {
-std::vector<std::string> load_gitignore() {
+std::vector<std::string> read_ignore_file(const std::string& path) {
     std::vector<std::string> pats;
-    std::ifstream f(".gitignore");
+    std::ifstream f(path);
     std::string line;
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -410,25 +470,87 @@ bool fnmatch_pat(const std::string& pat, const std::string& s) {
         return false;
     }
 }
-bool ignored_rel(const std::string& rel, bool is_dir, const std::vector<std::string>& pats) {
-    bool ignored = false;
-    for (auto& raw : pats) {
-        bool neg = !raw.empty() && raw[0] == '!';
-        std::string p = neg ? raw.substr(1) : raw;
-        bool dir_only = !p.empty() && p.back() == '/';
-        if (dir_only) p.pop_back();
-        bool anchored = p.find('/') != std::string::npos;
-        std::string target = anchored ? rel : (rel.find('/') == std::string::npos
-                                                   ? rel
-                                                   : rel.substr(rel.find_last_of('/') + 1));
-        if (dir_only && !is_dir) {
-            // `dir/` also ignores everything beneath it.
-            if (rel != p && rel.rfind(p + "/", 0) != 0) continue;
-            ignored = !neg;
-            continue;
-        }
-        if (fnmatch_pat(p, target) || (!anchored && fnmatch_pat("**/" + p, rel))) ignored = !neg;
+
+/// Hidden entries (leading `.`) are skipped, matching the ignore crate's
+/// default filter. The root itself ("."/root path) is never skipped.
+bool is_hidden_rel(const std::string& rel) {
+    std::size_t start = 0;
+    while (start < rel.size()) {
+        std::size_t slash = rel.find('/', start);
+        std::string comp = rel.substr(start, slash == std::string::npos ? slash : slash - start);
+        if (!comp.empty() && comp[0] == '.' && comp != "." && comp != "..") return true;
+        if (slash == std::string::npos) break;
+        start = slash + 1;
     }
+    return false;
+}
+
+/// Collect (scope, pattern) pairs: root .gitignore plus every ancestor
+/// dir's .gitignore for `rel`. A file's patterns only apply under its own
+/// directory (git semantics for nested .gitignore files).
+std::vector<std::pair<std::string, std::string>> ignore_stack_for(const std::string& root,
+                                                            const std::string& rel) {
+    std::vector<std::pair<std::string, std::string>> out;
+    auto add_file = [&](const std::string& scope) {
+        std::string fpath =
+            (scope.empty() ? root + "/.gitignore" : root + "/" + scope + "/.gitignore");
+        for (auto& pat : read_ignore_file(fpath)) out.emplace_back(scope, pat);
+    };
+    add_file("");
+    std::string prefix;
+    std::string relnorm = rel;
+    while (true) {
+        auto slash = relnorm.find('/');
+        if (slash == std::string::npos) break;
+        prefix = prefix.empty() ? relnorm.substr(0, slash) : prefix + "/" + relnorm.substr(0, slash);
+        add_file(prefix);
+        relnorm = relnorm.substr(slash + 1);
+    }
+    return out;
+}
+
+/// Match one pattern against a scope-relative path.
+bool match_scoped(const std::string& scope, const std::string& raw, const std::string& rel,
+                  bool is_dir, bool& ignored) {
+    // Only patterns from an ancestor scope apply.
+    std::string sub = rel;
+    if (!scope.empty()) {
+        if (rel != scope && rel.rfind(scope + "/", 0) != 0) return false;
+        sub = (rel == scope) ? "" : rel.substr(scope.size() + 1);
+        if (sub.empty()) return false; // the scope dir itself: only dir-patterns below apply
+    }
+    bool neg = !raw.empty() && raw[0] == '!';
+    std::string p = neg ? raw.substr(1) : raw;
+    bool anchored = false;
+    if (!p.empty() && p.front() == '/') {
+        anchored = true;
+        p.erase(p.begin());
+    }
+    bool dir_only = !p.empty() && p.back() == '/';
+    if (dir_only) p.pop_back();
+    if (!anchored && p.find('/') != std::string::npos) anchored = true;
+    std::string target =
+        anchored ? sub
+                 : (sub.find('/') == std::string::npos ? sub : sub.substr(sub.find_last_of('/') + 1));
+    if (dir_only && !is_dir) {
+        if (sub != p && sub.rfind(p + "/", 0) != 0) return false;
+        ignored = !neg;
+        return true;
+    }
+    if (fnmatch_pat(p, target) || (!anchored && fnmatch_pat("**/" + p, sub))) {
+        ignored = !neg;
+        return true;
+    }
+    return false;
+}
+
+bool path_ignored(const std::string& root, const std::string& rel, bool is_dir) {
+    if (rel == "." || rel.empty()) return false;
+    if (is_hidden_rel(rel)) return true;
+    if (rel == ".git" || rel.rfind(".git/", 0) == 0) return true;
+    bool ignored = false;
+    for (auto& [scope, pat] : ignore_stack_for(root, rel))
+        match_scoped(scope, pat, rel, is_dir, ignored);
     return ignored;
 }
 
@@ -487,7 +609,6 @@ ToolResult search_grep(const Json& args) {
         throw_hard(ToolError::bad_arguments("grep_search",
                                             std::string("invalid regex: ") + e.what()));
     }
-    auto pats = load_gitignore();
     std::vector<std::string> results;
     std::error_code ec;
     fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
@@ -499,11 +620,7 @@ ToolResult search_grep(const Json& args) {
         std::string rel = fs::relative(it->path(), root, ec).string();
         if (ec) rel = p;
         if (rel == ".") continue;
-        if (rel.rfind(".git/", 0) == 0 || rel == ".git") {
-            if (is_dir) it.disable_recursion_pending();
-            continue;
-        }
-        if (ignored_rel(rel, is_dir, pats)) {
+        if (path_ignored(root, rel, is_dir)) {
             if (is_dir) it.disable_recursion_pending();
             continue;
         }
@@ -512,7 +629,9 @@ ToolResult search_grep(const Json& args) {
         if (!f) continue;
         std::ostringstream ss;
         ss << f.rdbuf();
-        std::string content = utf8_lossy(ss.str());
+        std::string raw_bytes = ss.str();
+        if (!is_valid_utf8(raw_bytes)) continue; // read_to_string rejects
+        std::string content = raw_bytes;
         if (content.find('\0') != std::string::npos) continue;
         std::istringstream lines(content);
         std::string line;
@@ -557,7 +676,6 @@ ToolResult search_glob(const Json& args) {
     } catch (...) {
         return ToolResult::ok("no matches");
     }
-    auto pats = load_gitignore();
     std::vector<std::string> matches;
     std::error_code ec;
     fs::recursive_directory_iterator it(".", fs::directory_options::skip_permission_denied, ec), end;
@@ -569,11 +687,7 @@ ToolResult search_glob(const Json& args) {
             if (ec) continue;
             if (rel == ".") continue;
             while (rel.rfind("./", 0) == 0) rel.erase(0, 2);
-            if (rel.rfind(".git/", 0) == 0 || rel == ".git") {
-                if (is_dir) it.disable_recursion_pending();
-                continue;
-            }
-            if (ignored_rel(rel, is_dir, pats)) {
+            if (path_ignored(".", rel, is_dir)) {
                 if (is_dir) it.disable_recursion_pending();
                 continue;
             }
@@ -598,6 +712,8 @@ ToolResult search_glob(const Json& args) {
 // --- pty.rs --------------------------------------------------------------------------------------
 std::string sanitize_terminal_output(const std::string& raw) {
     // Strip OSC sequences: ESC ] <digits> ; ... (BEL | ESC \).
+    // NOTE: Rust regex `.` never matches `\n`, so a sequence spanning a
+    // newline is NOT stripped — replicate by stopping the scan at `\n`.
     std::string no_osc;
     for (std::size_t i = 0; i < raw.size();) {
         if (raw[i] == '\x1b' && i + 1 < raw.size() && raw[i + 1] == ']') {
@@ -606,7 +722,7 @@ std::string sanitize_terminal_output(const std::string& raw) {
             if (j < raw.size() && raw[j] == ';') {
                 j++;
                 bool closed = false;
-                while (j < raw.size()) {
+                while (j < raw.size() && raw[j] != '\n') {
                     if (raw[j] == '\x07') {
                         j++;
                         closed = true;
@@ -639,9 +755,10 @@ std::string sanitize_terminal_output(const std::string& raw) {
 
 void kill_process_group(std::int32_t pid) {
 #ifdef __unix__
+    // Negative-pid SIGKILL (whole group); ESRCH and other errors are ignored
+    // by the void C++ signature (Rust maps ESRCH→Ok).
     if (pid <= 0) return;
     ::kill(-pid, SIGKILL);
-    if (::kill(pid, 0) == 0) ::kill(pid, SIGKILL);
 #else
     (void)pid;
 #endif
@@ -664,12 +781,26 @@ std::string run_command_pty(const std::string& command, std::chrono::seconds tim
 #ifdef __unix__
     int master = -1;
     pid_t pid = ::forkpty(&master, nullptr, nullptr, nullptr);
-    if (pid < 0) return "failed to spawn pty";
+    if (pid < 0) {
+        int e = errno;
+        throw_hard(ToolError::execution(
+            std::string("Failed to create PTY: ") +
+            (e ? std::string(std::strerror(e)) + " (os error " + std::to_string(e) + ")"
+               : "unknown error")));
+    }
     if (pid == 0) {
         std::string wrapped = wrapped_one_shot(command);
         ::execl("/bin/sh", "sh", "-c", wrapped.c_str(), (char*)nullptr);
         ::_exit(127);
     }
+    // teardown(): the process group is ALWAYS SIGKILLed on completion or
+    // timeout (portable-pty Drop semantics), so no `sleep &` survives.
+    auto teardown = [&] {
+        ::kill(-pid, SIGKILL);
+        int st = 0;
+        ::waitpid(pid, &st, WNOHANG);
+        if (::close(master) == 0) master = -1;
+    };
     std::string output;
     auto deadline = std::chrono::steady_clock::now() + timeout;
     bool timed_out = false;
@@ -705,13 +836,11 @@ std::string run_command_pty(const std::string& command, std::chrono::seconds tim
         }
     }
     if (timed_out) {
-        ::kill(-pid, SIGKILL);
-        ::kill(pid, SIGKILL);
+        teardown();
         ::waitpid(pid, &status, 0);
-        ::close(master);
         return "[command timed out after " + std::to_string(timeout.count()) + "s and was killed]";
     }
-    ::close(master);
+    teardown();
     std::string clean = sanitize_terminal_output(output);
     while (!clean.empty() && clean.back() == '\n') clean.pop_back();
     return clean;
@@ -756,6 +885,23 @@ PtyManagerState& pty_state() {
     static PtyManagerState s;
     return s;
 }
+/// Forward declaration for reap_idle (used in ensure_pty_reaper before definition).
+void reap_idle(PtyManagerState& st);
+/// Background reaper (Rust: 30s tokio::interval): drops sessions idle >300s.
+/// Started once, on first spawn; detached for process lifetime.
+void ensure_pty_reaper() {
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(30));
+                auto& st = pty_state();
+                std::lock_guard<std::mutex> l(st.mutex);
+                reap_idle(st);
+            }
+        }).detach();
+    });
+}
 void reap_idle(PtyManagerState& st) {
     auto now = std::chrono::steady_clock::now();
     std::vector<std::string> dead;
@@ -778,12 +924,16 @@ void reap_idle(PtyManagerState& st) {
 #endif
     }
 }
-std::string take_delta(const std::shared_ptr<InteractiveSession>& sess) {
+std::string take_delta(const std::shared_ptr<InteractiveSession>& sess, bool stamp_activity) {
     std::lock_guard<std::mutex> l(sess->mutex);
     std::string delta = sess->output.substr(sess->cursor);
     sess->cursor = sess->output.size();
-    sess->last_activity = std::chrono::steady_clock::now();
+    if (stamp_activity) sess->last_activity = std::chrono::steady_clock::now();
     return sanitize_terminal_output(delta);
+}
+void touch_activity(const std::shared_ptr<InteractiveSession>& sess) {
+    std::lock_guard<std::mutex> l(sess->mutex);
+    sess->last_activity = std::chrono::steady_clock::now();
 }
 /// Session id with the exact upstream lookup + BadArguments detail.
 std::string session_id_of(const Json& args, const char* tool) {
@@ -807,11 +957,13 @@ ToolResult pty_spawn(const Json& args) {
     std::size_t rows = opt_u64(args, "rows", 24);
     std::size_t cols = opt_u64(args, "cols", 80);
 
+    std::string key = trim_sv(sid);
     auto& st = pty_state();
+    ensure_pty_reaper();
     {
         std::lock_guard<std::mutex> l(st.mutex);
         reap_idle(st);
-        st.sessions.erase(sid); // close existing same id (Drop => SIGKILL)
+        st.sessions.erase(key); // close existing same id (Drop => SIGKILL)
     }
     struct winsize ws {};
     ws.ws_row = static_cast<unsigned short>(rows ? rows : 24);
@@ -831,12 +983,12 @@ ToolResult pty_spawn(const Json& args) {
         ::_exit(127);
     }
     auto sess = std::make_shared<InteractiveSession>();
-    sess->id = sid;
+    sess->id = key;
     sess->master = master;
     sess->pid = pid;
     {
         std::lock_guard<std::mutex> l(st.mutex);
-        st.sessions[sid] = sess;
+        st.sessions[key] = sess;
     }
     std::thread([sess] {
         char buf[4096];
@@ -850,13 +1002,8 @@ ToolResult pty_spawn(const Json& args) {
         sess->alive = false;
     }).detach();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    std::string out = take_delta(sess);
-    bool alive;
-    {
-        std::lock_guard<std::mutex> l(sess->mutex);
-        alive = sess->alive;
-    }
-    (void)alive;
+    // Initial read advances the cursor but does NOT stamp activity (as in Rust).
+    std::string out = take_delta(sess, false);
     return ToolResult::ok("PTY session '" + sid + "' started.\nOutput:\n" + out);
 #else
     (void)args;
@@ -888,10 +1035,7 @@ ToolResult pty_write(const Json& args) {
                 "session."));
         sess = it->second;
     }
-    {
-        std::lock_guard<std::mutex> l(sess->mutex);
-        sess->last_activity = std::chrono::steady_clock::now();
-    }
+    touch_activity(sess);
     const char* p = text.c_str();
     std::size_t left = text.size();
     while (left > 0) {
@@ -910,7 +1054,7 @@ ToolResult pty_write(const Json& args) {
     }
     // NOTE: upstream flushes a BufWriter here; the raw fd needs no flush.
     std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms ? wait_ms : 300));
-    std::string out = take_delta(sess);
+    std::string out = take_delta(sess, true);
     bool alive;
     {
         std::lock_guard<std::mutex> l(sess->mutex);
@@ -942,7 +1086,7 @@ ToolResult pty_read(const Json& args) {
         sess = it->second;
     }
     if (wait_ms) std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-    std::string out = take_delta(sess);
+    std::string out = take_delta(sess, true);
     bool alive;
     {
         std::lock_guard<std::mutex> l(sess->mutex);
@@ -1064,6 +1208,36 @@ std::vector<types::ToolDef>& mcp_defs_store() {
 void set_mcp_tool_defs(std::vector<types::ToolDef> defs) { mcp_defs_store() = std::move(defs); }
 std::vector<types::ToolDef> mcp_tool_defs() { return mcp_defs_store(); }
 
+namespace {
+std::shared_ptr<const mcp::McpManager>& mcp_manager_slot() {
+    static std::shared_ptr<const mcp::McpManager> mgr;
+    return mgr;
+}
+} // namespace
+
+void set_mcp_manager(std::shared_ptr<const mcp::McpManager> mgr) {
+    mcp_manager_slot() = mgr;
+    if (!mgr) {
+        clear_mcp_tool_checker();
+        return;
+    }
+    std::vector<types::ToolDef> defs;
+    for (auto& t : mgr->tools())
+        defs.push_back(
+            types::ToolDef::from_mcp(t.name, t.description.value_or(""), t.input_schema));
+    set_mcp_tool_defs(defs);
+    set_mcp_tool_checker(
+        [mgr](const std::string& name) -> bool { return mgr->has_tool(name); },
+        [mgr](const std::string& name, const Json& args) -> ToolResult {
+            try {
+                return ToolResult::ok(mgr->call_tool(name, args));
+            } catch (const std::exception& e) {
+                return ToolResult::err("MCP tool error: " + std::string(e.what()));
+            }
+        });
+}
+std::shared_ptr<const mcp::McpManager> get_mcp_manager() { return mcp_manager_slot(); }
+
 std::string normalize_tool_name(const std::string& name) {
     if (name_in(name, {"read_file", "view_file", "get_file", "read"})) return "terminal__read_file";
     if (name_in(name, {"write_file", "create_file", "write_to_file", "save_file", "write"}))
@@ -1165,6 +1339,11 @@ static ToolResult dispatch_soft_body(const ToolInvocation& inv) {
 
 static ToolResult dispatch_manager_soft_body(const ToolInvocation& inv) {
     const std::string& n = inv.name;
+    if (mcp_has_tool(n)) {
+        // MCP override comes first here too (as in Rust dispatch_manager).
+        ToolResult r = mcp_call_tool(n, inv.arguments);
+        return r;
+    }
     if (n == "delegate_task") {
         return map_delegate(orchestrator::handle_delegate_task(inv.arguments));
     }
@@ -1200,19 +1379,19 @@ static ToolResult dispatch_specialist_soft_body(agents::Agent agent, const ToolI
     if (!agents::caller_allows_tool(agent, gate, agents::SpecialistRegistry::canonical()))
         throw_hard(ToolError::forbidden(n, agents::agent_to_string(agent)));
     if (n == "leave_verdict") {
+        // NOTE: only "verdict"/"comments" (no alias expansion here — the
+        // validator loop does its own alias-tolerant parsing).
         std::string verdict = "APPROVED";
         if (inv.arguments.is_object() && inv.arguments.contains("verdict") &&
             inv.arguments.at("verdict").is_string())
             verdict = inv.arguments.at("verdict").as_string();
-        std::string comments = opt_str(inv.arguments, {"comments", "comment", "feedback", "reason",
-                                                       "critique", "details", "explanation"});
+        std::string comments = opt_str(inv.arguments, {"comments"});
         return ToolResult::ok("Verdict recorded via leave_verdict: " + verdict +
                               " with comments: " + comments);
     }
     if (n == "delegate_task") {
         return map_delegate(orchestrator::handle_delegate_task(inv.arguments));
     }
-    if (n == "archive_current_plan") return archive_plan_impl();
     if (n == "rebirth")
         throw_hard(ToolError::bad_arguments(
             "rebirth", "rebirth requires a live ContextEngine; use dispatch_with_engine"));
@@ -1254,8 +1433,8 @@ static HarnessOutcome dispatch_outcome_inner(const ToolInvocation& inv,
 
 ToolResult dispatch(const ToolInvocation& inv) {
     if (mcp_has_tool(inv.name)) {
-        ToolResult r = mcp_call_tool(inv.name, inv.arguments);
-        return apply_tool_output_length_limit(r);
+        // Early return WITHOUT truncation (Rust returns before .map).
+        return mcp_call_tool(inv.name, inv.arguments);
     }
     return truncate_outcome(guard_outcome([&] { return dispatch_soft_body(inv); })).result;
 }

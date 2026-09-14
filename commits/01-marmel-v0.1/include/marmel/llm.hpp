@@ -107,7 +107,11 @@ types::ChatRequest apply_recovery(types::ChatRequest req, const RecoveryAdjustme
 struct NudgePolicy {
     unsigned max_attempts = 3;
     std::string nudge_text = "?";
+    NudgePolicy() = default;
+    NudgePolicy(unsigned max, std::string text) : max_attempts(max), nudge_text(std::move(text)) {}
+    static NudgePolicy with(unsigned max, std::string text) { return NudgePolicy(max, std::move(text)); }
     bool should_nudge(unsigned used) const { return used < max_attempts; }
+    unsigned max_attempts_count() const { return max_attempts; }
     std::vector<types::Message> nudge(std::vector<types::Message> transcript) const;
 };
 

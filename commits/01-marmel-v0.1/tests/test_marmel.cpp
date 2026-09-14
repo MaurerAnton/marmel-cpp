@@ -312,7 +312,7 @@ void t_chat_request_payload_construction() {
     req.messages = {types::Message::system("s"), types::Message::user("u")};
     req.tools = std::vector<types::ToolDef>{types::ToolDef::read_file(), types::ToolDef::write_file()};
     req.stream = true;
-    std::string dump = req.to_json(true).dump();
+    std::string dump = req.to_json().dump();
     CHECK_HAS(dump, "llama-3-70b");
     CHECK_HAS(dump, "read_file");
     CHECK_HAS(dump, "write_file");
@@ -635,12 +635,15 @@ void t_steer_outcome_fallback() {
 
 void t_widget_parse() {
     using namespace marmel;
-    auto ws = widget::parse("widget chat paragraph {\ntitle = \"Chat\"\n}\n");
+    auto ws = widget::parse("widget chat paragraph\n"
+                            "{\n"
+                            "title = \"Chat\"\n"
+                            "}\n");
     CHECK(ws.size() == 1 && ws[0].name == "chat");
     CHECK(ws[0].get("title") && *ws[0].get("title") == "Chat");
     bool threw = false;
     try {
-        widget::parse("widget x frobnicate {\n}\n");
+        widget::parse("widget x frobnicate\n{\n}\n");
     } catch (const widget::ParseError& e) {
         threw = true;
         CHECK_HAS(e.to_string(), "line ");

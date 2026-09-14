@@ -33,8 +33,11 @@ struct Widget {
     WidgetKind kind = WidgetKind::Paragraph;
     std::map<std::string, std::string> props;
     std::optional<std::string> get(const std::string& key) const;
-    bool get_bool(const std::string& key, bool fallback = false) const;
-    unsigned long long get_u64(const std::string& key, unsigned long long fallback = 0) const;
+    /// Some(true/false) when present (any non-true/yes/1 text is false);
+    /// nullopt when missing. Mirrors Rust Option<bool>.
+    std::optional<bool> get_bool(const std::string& key) const;
+    /// Parsed integer or nullopt when missing/unparsable.
+    std::optional<unsigned long long> get_u64(const std::string& key) const;
 };
 
 struct ParseError {

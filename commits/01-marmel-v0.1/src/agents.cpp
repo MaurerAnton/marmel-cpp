@@ -103,12 +103,25 @@ std::vector<std::string> all_agent_ids() {
 
 DelegationRequest DelegationRequest::from_json(const Json& v) {
     DelegationRequest r;
+    // Strict snake_case ids (serde derive): "deepbrain" is REJECTED here
+    // (agent_from_str's alias applies to scheduler/UI strings, not JSON).
     std::string agent_name = v.is_object() ? v.str_or("agent_name", "") : "";
-    auto agent = agent_from_str(agent_name);
-    if (!agent) throw std::runtime_error("unknown specialist: " + agent_name);
-    r.agent = *agent;
+    static const std::pair<const char*, Agent> kIds[] = {
+        {"coder", Agent::Coder}, {"researcher", Agent::Researcher}, {"debugger", Agent::Debugger},
+        {"validator", Agent::Validator}, {"generalist", Agent::Generalist}};
+    bool known = false;
+    for (auto& [id, a] : kIds) {
+        if (agent_name == id) {
+            r.agent = a;
+            known = true;
+            break;
+        }
+    }
+    if (!known) throw std::runtime_error("unknown specialist: " + agent_name);
     r.prompt = v.is_object() ? v.str_or("prompt", "") : "";
-    if (trim_copy(r.prompt).empty()) throw std::runtime_error("delegate_task requires a prompt");
+    if (trim_copy(r.prompt).empty())
+        throw std::runtime_error(
+            "`prompt` must be a non-empty, self-contained task brief");
     if (v.is_object() && v.contains("snippets") && v.at("snippets").is_array())
         for (auto& s : v.at("snippets").as_array())
             if (s.is_string()) r.snippets.push_back(s.as_string());
@@ -124,6 +137,8 @@ DelegationRequest DelegationRequest::from_json(const Json& v) {
     };
     r.image_urls = str_vec("image_urls");
     r.audio_urls = str_vec("audio_urls");
+    if (v.is_object() && v.contains("recursion_granted") && v.at("recursion_granted").is_bool())
+        r.recursion_granted = v.at("recursion_granted").as_bool(false);
     return r;
 }
 
@@ -178,19 +193,27 @@ std::string assemble_final_deliverable(bool validation_passed,
         if (!has_marker(out)) out += "\n\nMISSION COMPLETE";
         return out;
     }
-    std::string rejected = final_content;
+    std::string rejected;
+    if (validator_critique)
+        rejected += "VALIDATOR REJECTION: " + *validator_critique + "\n---------------\n";
+    std::string revision = final_content;
     {
         std::string::size_type pos = 0;
-        while ((pos = rejected.find("MISSION COMPLETE", pos)) != std::string::npos) {
-            rejected.replace(pos, 16, "REVOKED");
+        while ((pos = revision.find("MISSION COMPLETE", pos)) != std::string::npos) {
+            revision.replace(pos, 16, "REVOKED");
+            pos += 7;
+        }
+        pos = 0;
+        while ((pos = revision.find("mission complete", pos)) != std::string::npos) {
+            revision.replace(pos, 16, "REVOKED");
             pos += 7;
         }
     }
-    std::string out = "VALIDATOR REJECTION: " + validator_critique.value_or("(no critique)") +
-                      "\n---------------\n" + rejected;
-    if (out.find("FAILED") == std::string::npos && out.find("REPLAN REQUIRED") == std::string::npos)
-        out += "\n\nFAILED (Validator rejected the deliverable)";
-    return out;
+    rejected += revision;
+    if (rejected.find("FAILED") == std::string::npos &&
+        rejected.find("REPLAN REQUIRED") == std::string::npos)
+        rejected += "\n\nFAILED (Validator rejected deliverable)";
+    return rejected;
 }
 
 namespace {
@@ -214,18 +237,37 @@ const std::string_view& role_prompt_view(Agent agent) {
 std::string role_prompt_for(Agent agent) { return std::string(role_prompt_view(agent)); }
 
 Deliverable Specialist::run(const IsolatedContext& ctx) const {
-    // Deterministic canned double (mirrors #[cfg(test)] behavior): isolated
-    // role + brief + bounded snippets + terminal marker, no backend needed.
-    std::string task = ctx.task_id.value_or("t-000");
-    std::string out = "Specialist role ";
-    out += agent_as_str(name());
-    out += " working on " + task + "\nTASK BRIEF\n" + ctx.brief + "\nBOUNDED SNIPPETS\n";
-    for (auto& s : ctx.snippets) {
-        out += s;
-        out += "\n";
+    // Deterministic canned double (mirrors run_specialist_llm #[cfg(test)] /
+    // no-live-backend path): role first line + brief + bounded snippets +
+    // terminal marker. task_id is ALWAYS None here (the manager rebinds).
+    std::string trimmed_role = trim_copy(ctx.role_system_prompt);
+    std::string first_line = trimmed_role;
+    auto nl = first_line.find('\n');
+    if (nl != std::string::npos) first_line = first_line.substr(0, nl);
+    if (first_line.empty()) first_line = "specialist";
+    std::string snippet_block;
+    if (ctx.snippets.empty()) {
+        snippet_block = "(none)";
+    } else {
+        for (std::size_t i = 0; i < ctx.snippets.size(); i++) {
+            if (i) snippet_block += "\n---\n";
+            snippet_block += ctx.snippets[i];
+        }
     }
-    out += "MISSION COMPLETE (" + task + ")";
-    return Deliverable::complete(out, ctx.task_id);
+    std::string out = "Specialist role `" + first_line +
+                      "` executed its isolated task to completion.\n\nTASK BRIEF:\n" + ctx.brief +
+                      "\n\nBOUNDED SNIPPETS (" + std::to_string(ctx.snippets.size()) +
+                      "):\n" + snippet_block + "\n\nMISSION COMPLETE";
+    Deliverable d;
+    d.content = out;
+    d.task_id = std::nullopt;
+    auto marker = agent::MissionMarker::parse(out);
+    if (marker)
+        d.marker = *marker;
+    else
+        d.marker = agent::MissionMarker{agent::MissionMarker::Kind::Failed, std::nullopt,
+                                       "no terminal marker"};
+    return d;
 }
 
 std::vector<std::string> Coder::tool_namespaces() const {
@@ -237,10 +279,9 @@ std::vector<std::string> Researcher::tool_namespaces() const {
             "glob"};
 }
 std::vector<std::string> Debugger::tool_namespaces() const {
-    return {"delegate_task", "write_file", "replace",         "read_file", "run_command",
-            "grep_search",   "glob",        "pty_spawn",       "pty_write", "pty_read",
-            "pty_close",     "pty_list",    "pty__spawn",      "pty__write", "pty__read",
-            "pty__close",    "pty__list",   "pty_*"};
+    return {"delegate_task", "write_file", "replace", "read_file", "run_command",
+            "grep_search",   "glob",        "pty_spawn", "pty_write", "pty_read",
+            "pty_close",     "pty_list",    "pty__*",   "pty_*"};
 }
 std::vector<std::string> Validator::tool_namespaces() const {
     return {"delegate_task", "write_file", "replace", "read_file",         "run_command",
@@ -278,8 +319,8 @@ SpecialistRegistry SpecialistRegistry::canonical() {
            "glob"});
     r.reg(Agent::Debugger, "src/agents/debugger.rs",
           {"delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search",
-           "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list", "pty__spawn",
-           "pty__write", "pty__read", "pty__close", "pty__list", "pty_*"});
+           "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list", "pty__*",
+           "pty_*"});
     r.reg(Agent::Validator, "src/agents/validator.rs",
           {"delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search",
            "glob", "leave_verdict"});
@@ -310,9 +351,12 @@ std::shared_ptr<const SpecialistEntry> SpecialistRegistry::resolve(Agent agent) 
 }
 std::shared_ptr<const Specialist> SpecialistRegistry::worker(Agent agent) const {
     auto it = workers_.find(agent);
-    if (it != workers_.end()) return it->second;
-    static const auto kGeneralist = std::make_shared<Generalist>();
-    return kGeneralist;
+    // A well-behaved Manager routes ONLY to registered roles (resolve is the
+    // gate); unregistered roles throw rather than falling back (as in Rust,
+    // where the exhaustive match never falls back).
+    if (it == workers_.end())
+        throw std::runtime_error("no worker registered for role");
+    return it->second;
 }
 std::vector<std::string> SpecialistRegistry::agent_ids() const { return all_agent_ids(); }
 
@@ -500,7 +544,12 @@ std::pair<bool, std::string> run_automated_validation(const llm::ChatClient& cli
                 comments = args.str_or(k, "");
                 if (!comments.empty()) break;
             }
-            bool approved = to_upper(trim_copy(verdict)) == "APPROVED";
+            bool approved = false;
+            {
+                std::string v = verdict;
+                for (char& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                approved = (v == "approved"); // eq_ignore_ascii_case, NO trim (as in Rust)
+            }
             std::string critique;
             if (!comments.empty()) {
                 critique = trim_copy(comments);
@@ -685,11 +734,19 @@ Deliverable run_live(const llm::ChatClient& client, Agent agent, const IsolatedC
                 req.presence_penalty = cfg.presence_penalty;
                 req.stream = false;
                 req.tools = build_tools();
-                llm::StreamedReply reply = client.chat(req);
+                llm::StreamedReply reply;
+                try {
+                    reply = client.chat(req);
+                } catch (...) {
+                    break; // revision chat error ends the revision loop (as in Rust)
+                }
                 latest = reply.content;
                 std::vector<types::ToolCall> calls = reply.tool_calls;
                 if (calls.empty() && lc.xml_rescue) {
-                    auto rescued = monitor.rescue_xml(reply.content);
+                    // Fresh stats per revision turn (as in Rust).
+                    harness::HarnessMonitor revmon =
+                        harness::HarnessMonitor::with_new_stats();
+                    auto rescued = revmon.rescue_xml(reply.content);
                     if (!rescued.empty()) calls = rescued;
                 }
                 engine.append(types::Message::assistant(

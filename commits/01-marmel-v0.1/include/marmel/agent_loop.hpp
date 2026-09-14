@@ -93,6 +93,7 @@ using ToolDispatchFn = std::function<std::pair<bool, std::string>(const PendingT
 
 class AgentLoop {
 public:
+    AgentLoop(); // Default(Plan::default())
     explicit AgentLoop(Plan plan);
     AgentLoop(Plan plan, std::shared_ptr<harness::HarnessStats> stats);
     ~AgentLoop();
