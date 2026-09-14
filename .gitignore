@@ -4,9 +4,9 @@ cmake-build-*/
 *.o
 *.a
 
-# Binaries
-marmel
-marmel_tests
+# Binaries (anchored: must not match include/marmel/)
+/marmel
+/marmel_tests
 
 # Workspace runtime (created by runs)
 /.marmel/
