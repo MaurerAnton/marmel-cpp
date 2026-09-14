@@ -34,9 +34,44 @@ agent::ToolCaller caller_for(Agent agent) {
 }
 
 std::string format_tool_preview(const std::string& name, const Json& args) {
-    std::string dump = args.dump();
-    if (dump.size() > 200) dump = dump.substr(0, 200) + "…";
-    return name + "(" + dump + ")";
+    auto str_field = [&](const char* key) {
+        return args.is_object() ? args.str_or(key, "") : std::string();
+    };
+    auto utf8_head = [](const std::string& s, std::size_t max_bytes) {
+        if (s.size() <= max_bytes) return s;
+        std::size_t n = max_bytes;
+        while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) n--;
+        return s.substr(0, n);
+    };
+    if (name == "read_file" || name == "write_file") return str_field("path");
+    if (name == "replace") return str_field("path");
+    if (name == "run_command") {
+        std::string cmd = str_field("command");
+        // NOTE: Rust slices cmd[..32] in bytes (panics on non-boundary);
+        // the port backs off to the boundary instead.
+        if (cmd.size() > 35) return utf8_head(cmd, 32) + "...";
+        return cmd;
+    }
+    if (name == "grep_search") {
+        // NOTE: upstream reads the "query" alias key here, not "pattern".
+        if (args.is_object()) {
+            auto it = args.as_object().find("query");
+            if (it != args.as_object().end() && it->second.is_string())
+                return it->second.as_string();
+        }
+        return "";
+    }
+    if (name == "glob") return str_field("pattern");
+    if (name == "delegate_task") {
+        return "agent=" + str_field("agent_name") + ", task_id=" + str_field("task_id") +
+               ", prompt=\"" + str_field("prompt") + "\"";
+    }
+    if (name == "leave_verdict") {
+        return "verdict=" + str_field("verdict") + ", comments=\"" + str_field("comments") + "\"";
+    }
+    std::string s = args.dump();
+    if (s.size() > 30) return utf8_head(s, 27) + "...";
+    return s;
 }
 
 } // namespace
@@ -122,9 +157,12 @@ Deliverable Deliverable::replan(std::string content, std::string reason) {
 
 void update_revision(std::string& final_content, const std::string& revised) {
     if (revised.empty()) return;
-    if (final_content.find(revised) != std::string::npos) return;
-    if (!final_content.empty()) final_content += "\n";
-    final_content += revised;
+    if (final_content.empty()) {
+        final_content = revised;
+    } else if (final_content.find(revised) == std::string::npos) {
+        final_content += "\n\n";
+        final_content += revised;
+    }
 }
 
 std::string assemble_final_deliverable(bool validation_passed,
@@ -329,36 +367,51 @@ LiveCfg live_cfg_for(Agent agent, const config::Config& cfg) {
         else
             lc.validator_model = cfg.model;
     }
-    if (lc.validator_backend.empty()) lc.validator_backend = cfg.backend_url;
-    if (lc.validator_token.empty()) lc.validator_token = cfg.auth_token;
+    // Backend/token chain: specialist.validator_* → validator-role backend/auth
+    // → global (mirrors run_automated_validation).
+    auto vit = cfg.orchestration.specialists.find("validator");
+    if (lc.validator_backend.empty()) {
+        if (vit != cfg.orchestration.specialists.end() && vit->second.backend_url)
+            lc.validator_backend = *vit->second.backend_url;
+        else
+            lc.validator_backend = cfg.backend_url;
+    }
+    if (lc.validator_token.empty()) {
+        if (vit != cfg.orchestration.specialists.end() && vit->second.auth_token)
+            lc.validator_token = *vit->second.auth_token;
+        else
+            lc.validator_token = cfg.auth_token;
+    }
     return lc;
 }
 
 // Execute one assistant turn's tool calls; returns false when the loop must stop.
 bool execute_live_tools(const llm::ChatClient& client, Agent agent, agent::ContextEngine& engine,
                         const std::vector<types::ToolCall>& calls, harness::HarnessMonitor& monitor,
-                        const std::string& tag, std::shared_ptr<harness::HarnessStats> stats) {
+                        const std::string& status_tag,
+                        std::shared_ptr<harness::HarnessStats> stats) {
     (void)client;
     (void)stats;
     auto caller = caller_for(agent);
     for (auto& tc : calls) {
         Json args = Json::parse_or_string(tc.arguments);
         if (!args.is_object()) args = Json::object();
+        std::string preview = format_tool_preview(tc.name, args);
+        if (preview.empty())
+            orchestrator::emit_status(status_tag + ": " + tc.name);
+        else
+            orchestrator::emit_status(status_tag + ": " + tc.name + "(" + preview + ")");
         auto iv = monitor.observe_tool(tc.name, args);
         std::string result_text;
-        bool ok = true;
         if (auto err = monitor.intervention_error(iv)) {
             result_text = *err;
-            ok = false;
         } else {
-            orchestrator::emit_status(tag + ": " + format_tool_preview(tc.name, args));
-            harness::ToolResult r =
-                harness::dispatch_for(harness::ToolInvocation{tc.name, args}, caller);
-            result_text = r.content;
-            ok = !r.is_error;
+            harness::HarnessOutcome outcome = harness::dispatch_for_outcome(
+                harness::ToolInvocation{tc.name, args}, caller);
+            result_text = outcome.hard_error ? "ERROR: " + outcome.result.content
+                                             : outcome.result.content;
         }
         engine.append(types::Message::tool(tc.id, result_text));
-        (void)ok;
     }
     return true;
 }
@@ -379,9 +432,11 @@ std::pair<bool, std::string> run_automated_validation(const llm::ChatClient& cli
                             lc.validator_model.empty() ? cfg.model : lc.validator_model,
                             lc.validator_token);
     std::string sys(validator_prompt_for(agent));
-    std::string user = "Task Brief:\n" + brief + "\nDeliverable:\n" + deliverable +
-                       "\n1. Inspect the deliverable with your tools. 2. MUST call leave_verdict "
-                       "with APPROVED or REJECTED and comments.";
+    std::string user = "Task Brief:\n" + brief + "\n\nSpecialist Deliverable:\n" + deliverable +
+                       "\n\nInstructions:\n1. Inspect the workspace, verify files, compile, and run "
+                       "tests as needed using available tools.\n2. When your verification is "
+                       "complete, you MUST call the `leave_verdict` tool with `verdict` "
+                       "('APPROVED' or 'REJECTED') and detailed `comments`.";
     agent::ContextEngineFactory f(cfg.max_context_tokens);
     agent::ContextEngine engine = f.specialist_context(sys, user);
     harness::HarnessMonitor monitor;
@@ -397,59 +452,77 @@ std::pair<bool, std::string> run_automated_validation(const llm::ChatClient& cli
         req.model = lc.validator_model.empty() ? cfg.model : lc.validator_model;
         req.messages = engine.messages();
         req.temperature = 0.0f;
-        req.top_p = 0.9f;
+        req.top_p = cfg.top_p;
+        req.presence_penalty = cfg.presence_penalty;
+        req.frequency_penalty = cfg.frequency_penalty;
         req.stream = false;
         std::vector<types::ToolDef> tools;
         for (auto& t : all) {
             bool ok = false;
             for (auto& ns : allow) {
-                if (ns == "*" || ns == t.name) {
+                SpecialistEntry tmp;
+                tmp.tool_namespaces = {ns};
+                if (tmp.allows(t.name)) {
                     ok = true;
                     break;
                 }
             }
             if (ok) tools.push_back(t);
         }
+        // MCP-bridged tools are visible unfiltered (as in Rust).
+        for (auto& md : harness::mcp_tool_defs()) tools.push_back(md);
         req.tools = tools;
         llm::StreamedReply reply;
         try {
             reply = vclient.chat(req);
-        } catch (const std::exception& e) {
-            return {false, std::string("validator backend error: ") + e.what()};
+        } catch (const std::exception&) {
+            break; // fall through to the no-verdict message (as in Rust)
         }
         std::vector<types::ToolCall> calls = reply.tool_calls;
-        if (cfg.enable_xml_rescue && calls.empty()) {
+        if (calls.empty() && cfg.enable_xml_rescue) {
             auto rescued = monitor.rescue_xml(reply.content);
-            calls = rescued;
+            if (!rescued.empty()) calls = rescued;
         }
-        engine.append(types::Message::assistant(
-            reply.content.empty() ? std::optional<std::string>{} : std::optional<std::string>{reply.content},
-            reply.reasoning.empty() ? std::optional<std::string>{} : std::optional<std::string>{reply.reasoning},
-            calls));
+        engine.append(types::Message::assistant(std::optional<std::string>{reply.content},
+                                               reply.reasoning.empty()
+                                                   ? std::optional<std::string>{}
+                                                   : std::optional<std::string>{reply.reasoning},
+                                               calls));
         // leave_verdict wins immediately.
         for (auto& tc : calls) {
             if (tc.name != "leave_verdict") continue;
             Json args = Json::parse_or_string(tc.arguments);
-            std::string verdict = args.is_object() ? args.str_or("verdict", "") : "";
+            if (!args.is_object()) args = Json::object();
+            std::string verdict = args.str_or("verdict", "APPROVED");
             std::string comments;
-            if (args.is_object()) {
-                for (auto k : {"comments", "comment", "feedback", "reason", "critique", "details",
-                               "explanation"}) {
-                    comments = args.str_or(k, "");
-                    if (!comments.empty()) break;
-                }
+            for (auto k : {"comments", "comment", "feedback", "reason", "critique", "details",
+                           "explanation"}) {
+                comments = args.str_or(k, "");
+                if (!comments.empty()) break;
             }
-            std::string u = to_upper(trim_copy(verdict));
-            return {u == "APPROVED", comments};
+            bool approved = to_upper(trim_copy(verdict)) == "APPROVED";
+            std::string critique;
+            if (!comments.empty()) {
+                critique = trim_copy(comments);
+            } else if (approved) {
+                critique = "Deliverable verified and approved.";
+            } else {
+                critique = "Deliverable rejected by validator without detailed comments.";
+            }
+            return {approved, critique};
         }
         if (calls.empty()) {
             engine.append(types::Message::user(
-                "System: you MUST call leave_verdict with APPROVED or REJECTED and comments."));
+                "System: You have not submitted a verdict. If you need to perform further "
+                "verification, please invoke the appropriate tools (e.g., running commands or "
+                "reading files). If your analysis is complete, you must call the 'leave_verdict' "
+                "tool to submit your final verdict (APPROVED or REJECTED)."));
             continue;
         }
-        execute_live_tools(vclient, Agent::Validator, engine, calls, monitor, "validator", nullptr);
+        std::string vtag = std::string("validator-") + agent_to_string(agent);
+        execute_live_tools(vclient, Agent::Validator, engine, calls, monitor, vtag, nullptr);
     }
-    return {false, "failed to submit verdict"};
+    return {false, "The validator failed to submit a verdict using the 'leave_verdict' tool."};
 }
 
 } // namespace
@@ -469,27 +542,33 @@ Deliverable run_live(const llm::ChatClient& client, Agent agent, const IsolatedC
                      const config::Config& cfg, std::shared_ptr<harness::HarnessStats> stats) {
     if (!stats) stats = std::make_shared<harness::HarnessStats>();
     LiveCfg lc = live_cfg_for(agent, cfg);
-    std::string tag = agent_to_string(agent) + "-" + ctx.task_id.value_or("no-task");
+    std::string tag = (ctx.task_id && !trim_copy(*ctx.task_id).empty())
+                          ? agent_to_string(agent) + "-" + *ctx.task_id
+                          : agent_to_string(agent);
     std::error_code ec;
     std::string cwd = std::filesystem::current_path(ec).string();
     if (ec) cwd = ".";
     std::string enhanced =
-        std::string(role_prompt_view(agent)) + "\n## Environment & Workspace\nCWD: " + cwd +
-        "\nTools: write_file, replace, read_file, run_command, grep_search, glob, delegate_task, "
-        "pty_spawn, pty_write, pty_read, pty_close, pty_list, rebirth, leave_verdict.";
+        std::string(role_prompt_view(agent)) +
+        "\n\n## Environment & Workspace\n- Current Working Directory (CWD): `" + cwd +
+        "`\n- All relative paths and file operations resolve against this workspace directory.\n- "
+        "Tools available: `write_file`, `replace`, `read_file`, `run_command`, `grep_search`, "
+        "`glob`.\n- You MUST save files and execute real work to complete the task.";
     agent::ContextEngineFactory factory(cfg.max_context_tokens);
     agent::ContextEngine engine = factory.specialist_context(enhanced, ctx.brief);
     if (!ctx.snippets.empty()) {
         std::string sn = "Snippets:\n";
-        for (auto& s : ctx.snippets) {
-            sn += s;
-            sn += "\n";
+        for (std::size_t i = 0; i < ctx.snippets.size(); i++) {
+            if (i) sn += "\n---\n";
+            sn += ctx.snippets[i];
         }
         engine.append(types::Message::user(sn));
     }
+    // NOTE: fresh (non-shared) stats for the live loop, as in Rust.
+    config::MonitoringConfig default_mon;
+    const config::MonitoringConfig& mon_cfg = cfg.monitoring ? *cfg.monitoring : default_mon;
     harness::HarnessMonitor monitor =
-        cfg.monitoring ? harness::HarnessMonitor::new_with_config(stats, *cfg.monitoring)
-                       : harness::HarnessMonitor(stats);
+        harness::HarnessMonitor::new_with_config(std::make_shared<harness::HarnessStats>(), mon_cfg);
     auto guard = orchestrator::register_active_worker(ctx.task_id, agent_to_string(agent), ctx.brief);
 
     SpecialistRegistry reg = SpecialistRegistry::canonical();
@@ -497,22 +576,10 @@ Deliverable run_live(const llm::ChatClient& client, Agent agent, const IsolatedC
     std::vector<std::string> allow =
         entry ? entry->tool_namespaces : std::vector<std::string>{"*"};
 
-    std::string final_content;
-    unsigned nudge_count = 0;
-    for (int turn = 0; turn < 100; turn++) {
-        orchestrator::emit_status(tag + ": thinking...");
-        types::ChatRequest req;
-        req.model = lc.model;
-        req.messages = engine.messages();
-        req.temperature = cfg.temperature;
-        req.top_p = cfg.top_p;
-        req.frequency_penalty = cfg.frequency_penalty;
-        req.presence_penalty = cfg.presence_penalty;
-        req.stream = false;
-        auto all = types::ToolDef::default_tools(all_agent_ids());
-        for (auto& md : harness::mcp_tool_defs()) all.push_back(md);
+    auto build_tools = [&] {
+        auto defs = types::ToolDef::default_tools(all_agent_ids());
         std::vector<types::ToolDef> tools;
-        for (auto& t : all) {
+        for (auto& t : defs) {
             bool ok = false;
             for (auto& ns : allow) {
                 SpecialistEntry tmp;
@@ -524,20 +591,40 @@ Deliverable run_live(const llm::ChatClient& client, Agent agent, const IsolatedC
             }
             if (ok) tools.push_back(t);
         }
-        req.tools = tools;
+        // MCP-bridged tools are visible unfiltered (as in Rust).
+        for (auto& md : harness::mcp_tool_defs()) tools.push_back(md);
+        return tools;
+    };
+
+    std::string final_content;
+    unsigned nudge_count = 0;
+    for (int turn = 0; turn < 100; turn++) {
+        orchestrator::emit_status(tag + ": thinking / calling model (" + lc.model + ")...");
+        types::ChatRequest req;
+        req.model = lc.model;
+        req.messages = engine.messages();
+        req.temperature = cfg.temperature;
+        req.top_p = cfg.top_p;
+        req.frequency_penalty = cfg.frequency_penalty;
+        req.presence_penalty = cfg.presence_penalty;
+        req.stream = false;
+        req.tools = build_tools();
         llm::StreamedReply reply = client.chat(req);
         update_revision(final_content, reply.content);
         std::vector<types::ToolCall> calls = reply.tool_calls;
-        if (lc.xml_rescue && calls.empty()) calls = monitor.rescue_xml(reply.content);
+        if (calls.empty() && lc.xml_rescue) {
+            auto rescued = monitor.rescue_xml(reply.content);
+            if (!rescued.empty()) calls = rescued;
+        }
         engine.append(types::Message::assistant(
-            reply.content.empty() ? std::optional<std::string>{} : std::optional<std::string>{reply.content},
-            reply.reasoning.empty() ? std::optional<std::string>{} : std::optional<std::string>{reply.reasoning},
+            std::optional<std::string>{reply.content},
+            reply.reasoning.empty() ? std::optional<std::string>{}
+                                    : std::optional<std::string>{reply.reasoning},
             calls));
         if (calls.empty()) {
             if (has_terminal_marker(reply.content)) break;
             if (nudge_count < 3) {
                 nudge_count++;
-                if (stats) stats->record_empty_prod();
                 engine.append(types::Message::user(
                     "SYSTEM NOTICE: You did not call any tools or output MISSION COMPLETE. Please "
                     "use your tools (such as `read_file`, `write_file`, `run_command`, etc.) to "
@@ -551,58 +638,62 @@ Deliverable run_live(const llm::ChatClient& client, Agent agent, const IsolatedC
         if (engine.should_compact()) engine.compact();
     }
 
-    bool validation_passed = true;
+    bool validation_passed = !lc.enable_validator || lc.max_validator_iterations == 0 ||
+                             agent == Agent::Validator;
     std::optional<std::string> critique;
-    bool do_validate = lc.enable_validator && lc.max_validator_iterations > 0 && agent != Agent::Validator;
+    bool do_validate = lc.enable_validator && lc.max_validator_iterations > 0 &&
+                       agent != Agent::Validator && !final_content.empty();
     if (do_validate) {
         validation_passed = false;
         for (std::size_t vi = 0; vi < lc.max_validator_iterations; vi++) {
-            orchestrator::emit_status(tag + ": validator testing... (pass " +
+            orchestrator::emit_status("validator-" + tag + ": testing deliverable (pass " +
                                       std::to_string(vi + 1) + "/" +
-                                      std::to_string(lc.max_validator_iterations) + ")");
+                                      std::to_string(lc.max_validator_iterations) + ")...");
             auto [approved, fb] = run_automated_validation(client, agent, ctx.brief, final_content,
                                                            lc, cfg);
             if (approved) {
+                std::string feedback =
+                    trim_copy(fb).empty() ? "All verification checks passed." : fb;
+                orchestrator::emit_status("[Validator] APPROVED deliverable for " + tag + ":\n" +
+                                          feedback);
                 validation_passed = true;
                 critique.reset();
                 break;
             }
-            critique = fb;
-            orchestrator::emit_status(tag + ": validator REJECTED, revising...");
+            std::string feedback =
+                trim_copy(fb).empty() ? "Deliverable failed verification checks." : fb;
+            critique = feedback;
+            orchestrator::emit_status("[Validator] REJECTED deliverable for " + tag + " (pass " +
+                                      std::to_string(vi + 1) + "/" +
+                                      std::to_string(lc.max_validator_iterations) +
+                                      "):\n" + feedback);
             engine.append(types::Message::user(
-                "Validation feedback: " + fb +
-                ". Please address all validator critique points, verify your work with available "
+                "Validation feedback: The validator tested your changes and found issues:\n" +
+                feedback +
+                "\n\nPlease address all validator critique points, verify your work with available "
                 "tools, and conclude with 'MISSION COMPLETE'."));
             std::string latest;
             for (int rt = 0; rt < 25; rt++) {
+                orchestrator::emit_status(tag + ": revising code per validator critique (step " +
+                                          std::to_string(rt + 1) + "/25)...");
                 types::ChatRequest req;
                 req.model = lc.model;
                 req.messages = engine.messages();
                 req.temperature = cfg.temperature;
                 req.top_p = cfg.top_p;
+                req.frequency_penalty = cfg.frequency_penalty;
+                req.presence_penalty = cfg.presence_penalty;
                 req.stream = false;
-                auto all = types::ToolDef::default_tools(all_agent_ids());
-                std::vector<types::ToolDef> tools;
-                for (auto& t : all) {
-                    bool ok = false;
-                    for (auto& ns : allow) {
-                        SpecialistEntry tmp;
-                        tmp.tool_namespaces = {ns};
-                        if (tmp.allows(t.name)) {
-                            ok = true;
-                            break;
-                        }
-                    }
-                    if (ok) tools.push_back(t);
-                }
-                req.tools = tools;
+                req.tools = build_tools();
                 llm::StreamedReply reply = client.chat(req);
-                if (!reply.content.empty()) latest = reply.content;
+                latest = reply.content;
                 std::vector<types::ToolCall> calls = reply.tool_calls;
-                if (lc.xml_rescue && calls.empty()) calls = monitor.rescue_xml(reply.content);
+                if (calls.empty() && lc.xml_rescue) {
+                    auto rescued = monitor.rescue_xml(reply.content);
+                    if (!rescued.empty()) calls = rescued;
+                }
                 engine.append(types::Message::assistant(
-                    reply.content.empty() ? std::optional<std::string>{}
-                                          : std::optional<std::string>{reply.content},
+                    std::optional<std::string>{reply.content},
                     reply.reasoning.empty() ? std::optional<std::string>{}
                                             : std::optional<std::string>{reply.reasoning},
                     calls));
@@ -612,7 +703,9 @@ Deliverable run_live(const llm::ChatClient& client, Agent agent, const IsolatedC
             if (!latest.empty()) final_content = latest;
         }
     }
-    std::string assembled = assemble_final_deliverable(validation_passed, critique, final_content);
+    std::string assembled;
+    if (!final_content.empty())
+        assembled = assemble_final_deliverable(validation_passed, critique, final_content);
     auto marker = agent::MissionMarker::parse(assembled);
     Deliverable d;
     d.content = assembled;

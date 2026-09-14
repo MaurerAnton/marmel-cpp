@@ -308,7 +308,7 @@ std::string CrashJournal::snapshot(agents::Agent agent, const agents::Delegation
     {
         std::ofstream f(frozen_path(), std::ios::binary | std::ios::trunc);
         if (!f) throw std::runtime_error("cannot write frozen state: " + frozen_path());
-        f << snap.to_json().dump();
+        f << snap.to_json().dump_pretty(); // serde_json::to_string_pretty
     }
     {
         std::ofstream j(journal_path(), std::ios::binary | std::ios::app);
@@ -719,12 +719,12 @@ std::string OrchestratorManager::synthesize(const std::vector<agents::Deliverabl
     return out;
 }
 
-std::pair<bool, std::string> handle_delegate_task(const Json& args) {
+orchestrator::DelegateOutcome handle_delegate_task(const Json& args) {
     agents::DelegationRequest req;
     try {
         req = agents::DelegationRequest::from_json(args);
     } catch (const std::exception& e) {
-        return {false, "delegate_task: " + std::string(e.what())};
+        return {false, true, "invalid arguments for delegate_task: " + std::string(e.what())};
     }
     // Guard (always-on in C++; Rust gates it to non-test builds): reject
     // re-delegation of already checked-off tasks.
@@ -737,10 +737,11 @@ std::pair<bool, std::string> handle_delegate_task(const Json& args) {
             while (std::getline(in, line)) {
                 if (to_lower(line).find(needle) != std::string::npos &&
                     (line.find("[x]") != std::string::npos || line.find("[X]") != std::string::npos))
-                    return {false, "Task '" + *req.task_id +
-                                        "' is already completed and checked off in the execution "
-                                        "plan. Do not re-delegate completed tasks. Proceed with "
-                                        "your final report synthesis."};
+                    return {false, false,
+                            "Task '" + *req.task_id +
+                                "' is already completed and checked off in the execution "
+                                "plan. Do not re-delegate completed tasks. Proceed with "
+                                "your final report synthesis."};
             }
         }
     }
@@ -751,18 +752,18 @@ std::pair<bool, std::string> handle_delegate_task(const Json& args) {
     try {
         d = manager.delegate(req);
     } catch (const std::exception& e) {
-        return {false, std::string(e.what())};
+        return {false, true, std::string(e.what())};
     }
     std::string tid = d.task_id.value_or("unknown");
     switch (d.marker.kind) {
         case agent::MissionMarker::Kind::Complete:
-            return {true, d.content + "\n\nMISSION COMPLETE (" + tid + ")"};
+            return {true, false, d.content + "\n\nMISSION COMPLETE (" + tid + ")"};
         case agent::MissionMarker::Kind::Failed:
-            return {false, d.content + "\n\nFAILED: " + d.marker.reason};
+            return {false, false, d.content + "\n\nFAILED: " + d.marker.reason};
         case agent::MissionMarker::Kind::Replan:
-            return {false, d.content + "\n\nREPLAN REQUIRED: " + d.marker.reason};
+            return {false, false, d.content + "\n\nREPLAN REQUIRED: " + d.marker.reason};
     }
-    return {false, d.content};
+    return {false, true, d.content};
 }
 
 } // namespace marmel::orchestrator

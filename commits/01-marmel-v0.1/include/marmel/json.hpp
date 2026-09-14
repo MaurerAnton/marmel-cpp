@@ -149,6 +149,14 @@ public:
         return out;
     }
 
+    /// Pretty printer (2-space indent), mirroring serde_json::to_string_pretty.
+    /// Used for pty_list output and the Deep-Freeze snapshot file.
+    std::string dump_pretty() const {
+        std::string out;
+        dump_pretty_into(out, 0);
+        return out;
+    }
+
     static Json parse(const std::string& text) { return parse(std::string_view(text)); }
     static Json parse(const char* text) { return parse(std::string_view(text ? text : "")); }
     static Json parse(std::string_view text) {
@@ -352,6 +360,51 @@ private:
                 }
                 out += '}';
                 break;
+        }
+    }
+    void dump_pretty_into(std::string& out, int depth) const {
+        std::string pad(static_cast<std::size_t>(depth) * 2, ' ');
+        std::string pad1(static_cast<std::size_t>(depth + 1) * 2, ' ');
+        switch (type_) {
+            case Type::Null:
+            case Type::Bool:
+            case Type::Number:
+            case Type::String: dump_into(out); break;
+            case Type::Array: {
+                if (!array_ || array_->empty()) {
+                    out += "[]";
+                    break;
+                }
+                out += "[\n";
+                for (std::size_t i = 0; i < array_->size(); i++) {
+                    out += pad1;
+                    (*array_)[i].dump_pretty_into(out, depth + 1);
+                    if (i + 1 < array_->size()) out += ',';
+                    out += '\n';
+                }
+                out += pad;
+                out += ']';
+                break;
+            }
+            case Type::Object: {
+                if (!object_ || object_->empty()) {
+                    out += "{}";
+                    break;
+                }
+                out += "{\n";
+                std::size_t i = 0;
+                for (auto& kv : *object_) {
+                    out += pad1;
+                    dump_string(out, kv.first);
+                    out += ": ";
+                    kv.second.dump_pretty_into(out, depth + 1);
+                    if (++i < object_->size()) out += ',';
+                    out += '\n';
+                }
+                out += pad;
+                out += '}';
+                break;
+            }
         }
     }
     static void dump_string(std::string& out, const std::string& s) {

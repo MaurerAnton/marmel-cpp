@@ -486,18 +486,19 @@ void t_orchestr_handle_delegate_task() {
     CwdGuard guard(tmp.path);
     auto bad = orchestrator::handle_delegate_task(obj({{"agent_name", Json("planner")},
                                                        {"prompt", Json("x")}}));
-    CHECK(!bad.first);
+    CHECK(!bad.ok && bad.hard);
+    CHECK_HAS(bad.content, "invalid arguments for delegate_task");
     auto blank = orchestrator::handle_delegate_task(
         obj({{"agent_name", Json("coder")}, {"prompt", Json("   ")}}));
-    CHECK(!blank.first);
+    CHECK(!blank.ok && blank.hard);
     marmel::Json::Array sn;
     auto ok = orchestrator::handle_delegate_task(obj({{"agent_name", Json("coder")},
                                                       {"prompt", Json("build it")},
                                                       {"snippets", marmel::Json(std::move(sn))},
                                                       {"task_id", Json("t-500")}}));
-    CHECK(ok.first);
-    CHECK_HAS(ok.second, "MISSION COMPLETE (t-500)");
-    CHECK_HAS(ok.second, "build it");
+    CHECK(ok.ok && !ok.hard);
+    CHECK_HAS(ok.content, "MISSION COMPLETE (t-500)");
+    CHECK_HAS(ok.content, "build it");
 }
 
 // --- test_role_gating.rs --------------------------------------------------------------------------
@@ -737,6 +738,83 @@ void t_tooldef_descriptions_exact() {
     CHECK(tools.front().name == "delegate_task" && tools.back().name == "leave_verdict");
 }
 
+void t_dispatch_outcome_hard_soft() {
+    using namespace marmel;
+    agent::ToolCaller manager = agent::ToolCaller::manager();
+    // Hard: unknown tool for the Manager hits the allowlist first
+    // (Rust dispatch_manager → Forbidden), exactly as upstream.
+    {
+        harness::HarnessOutcome o =
+            harness::dispatch_for_outcome(harness::ToolInvocation{"frobnicate", obj({})}, manager);
+        CHECK(o.hard_error && o.result.is_error);
+        CHECK(o.result.content ==
+              "tool `frobnicate` is forbidden for caller `Manager` by orchestration policy");
+    }
+    // Hard: the legacy dispatch() table reports UnknownTool verbatim.
+    {
+        harness::ToolResult r = harness::dispatch(harness::ToolInvocation{"frobnicate", obj({})});
+        CHECK(r.is_error);
+        CHECK_HAS(r.content, "unknown tool: frobnicate");
+    }
+    // Hard: Forbidden carries the exact thiserror text.
+    {
+        harness::HarnessOutcome o = harness::dispatch_for_outcome(
+            harness::ToolInvocation{"write_file",
+                                    obj({{"path", Json("x")}, {"content", Json("y")}})},
+            manager);
+        CHECK(o.hard_error);
+        CHECK(o.result.content ==
+              "tool `write_file` is forbidden for caller `Manager` by orchestration policy");
+    }
+    // Hard: BadArguments carries the exact thiserror text.
+    {
+        harness::HarnessOutcome o = harness::dispatch_for_outcome(
+            harness::ToolInvocation{"read_file", obj({{"offset", Json("x")}})}, manager);
+        CHECK(o.hard_error);
+        CHECK_HAS(o.result.content, "invalid arguments for read_file");
+        CHECK_HAS(o.result.content, "missing string field `path`");
+    }
+    // Soft: replace ambiguity is Ok(err) — no ERROR prefix upstream.
+    {
+        TempDir tmp;
+        std::string p = tmp.path + "/u.txt";
+        {
+            std::ofstream f(p);
+            f << "aaa bbb aaa";
+        }
+        agent::ToolCaller coder = agent::ToolCaller::specialist("coder");
+        harness::HarnessOutcome o = harness::dispatch_for_outcome(
+            harness::ToolInvocation{
+                "replace",
+                obj({{"path", Json(p)}, {"old_str", Json("aaa")}, {"new_str", Json("z")}})},
+            coder);
+        CHECK(!o.hard_error && o.result.is_error);
+        CHECK_HAS(o.result.content, "ambiguous");
+    }
+    // Hard: missing file is an Execution error with the OS text.
+    {
+        agent::ToolCaller coder = agent::ToolCaller::specialist("coder");
+        harness::HarnessOutcome o = harness::dispatch_for_outcome(
+            harness::ToolInvocation{"read_file",
+                                    obj({{"path", Json("/tmp/marmel-test-no-such-file-xyz")}})},
+            coder);
+        CHECK(o.hard_error && o.result.is_error);
+        CHECK_HAS(o.result.content, "os error");
+        (void)o;
+    }
+}
+
+void t_update_revision_separator() {
+    using namespace marmel;
+    std::string acc;
+    agents::update_revision(acc, "first");
+    CHECK(acc == "first");
+    agents::update_revision(acc, "second");
+    CHECK(acc == "first\n\nsecond");
+    agents::update_revision(acc, "first"); // substring: no-op
+    CHECK(acc == "first\n\nsecond");
+}
+
 void t_workspace_creates_and_validates() {
     using namespace marmel;
     TempDir tmp;
@@ -810,6 +888,8 @@ int main() {
     RUN(t_chunk_utf8_and_commands);
     RUN(t_assemble_deliverable);
     RUN(t_semantic_json_eq);
+    RUN(t_dispatch_outcome_hard_soft);
+    RUN(t_update_revision_separator);
     RUN(t_workspace_creates_and_validates);
     RUN(t_workspace_default_root);
     RUN(t_tooldef_descriptions_exact);

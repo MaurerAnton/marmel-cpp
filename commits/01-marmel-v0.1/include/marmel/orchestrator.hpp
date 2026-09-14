@@ -263,7 +263,15 @@ private:
 };
 
 /// Tool-entrypoint behind `delegate_task` (used by the harness dispatcher).
-/// Returns {ok, content}: ok=false maps to ToolResult::err.
-std::pair<bool, std::string> handle_delegate_task(const Json& args);
+/// Mirrors Rust `Result<ToolResult, ToolError>`: hard=true is the Err path
+/// (unknown agent/blank prompt/execution failure → transcript "ERROR: "),
+/// hard=false with ok=false is Ok(err) (FAILED/REPLAN markers, re-delegation
+/// guard).
+struct DelegateOutcome {
+    bool ok = false;
+    bool hard = false;
+    std::string content;
+};
+DelegateOutcome handle_delegate_task(const Json& args);
 
 } // namespace marmel::orchestrator

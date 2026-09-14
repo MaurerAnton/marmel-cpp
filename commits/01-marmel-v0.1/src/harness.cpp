@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -125,9 +126,10 @@ const char* str_field(const Json& args, std::initializer_list<const char*> keys)
 std::string ToolError::message() const {
     switch (kind) {
         case Kind::UnknownTool: return "unknown tool: " + tool;
-        case Kind::BadArguments: return tool + ": " + detail;
+        case Kind::BadArguments: return "invalid arguments for " + tool + ": " + detail;
         case Kind::Forbidden:
-            return "forbidden: tool `" + tool + "` is not available to " + caller;
+            return "tool `" + tool + "` is forbidden for caller `" + caller +
+                   "` by orchestration policy";
         case Kind::Execution: return detail;
     }
     return detail;
@@ -190,58 +192,68 @@ std::string map_path(const std::string& path) {
 
 namespace {
 
-const char* req_str(const Json& args, const char* key, const char* tool, ToolResult*& err_out,
-                    ToolResult& storage, std::initializer_list<const char*> aliases) {
-    std::vector<const char*> keys{key};
-    for (auto a : aliases) keys.push_back(a);
-    if (!args.is_object()) {
-        storage = ToolResult::err(std::string(tool) + ": missing string field `" + key + "`");
-        err_out = &storage;
-        return nullptr;
-    }
-    for (auto k : keys) {
-        auto it = args.as_object().find(k);
-        if (it != args.as_object().end() && it->second.is_string()) return it->second.as_string().c_str();
-    }
-    storage = ToolResult::err(std::string(tool) + ": missing string field `" + key + "`");
-    err_out = &storage;
-    return nullptr;
+std::string os_error_text() {
+    int e = errno;
+    if (e == 0) return "I/O error";
+    return std::string(std::strerror(e)) + " (os error " + std::to_string(e) + ")";
 }
 
-bool req_usize(const Json& args, const char* key, std::size_t def, const char* tool,
-               std::size_t& out, ToolResult& storage, bool& failed) {
-    if (!args.is_object() || !args.contains(key)) {
-        out = def;
-        return true;
+/// Required string arg with model-paraphrase aliases. Throws HardToolError
+/// (Rust `?` on BadArguments) when absent — mirrors str_arg call sites.
+std::string req_str(const Json& args, const char* key, const char* tool,
+                    std::initializer_list<const char*> aliases = {}) {
+    if (args.is_object()) {
+        auto it = args.as_object().find(key);
+        if (it != args.as_object().end() && it->second.is_string()) return it->second.as_string();
+        for (auto a : aliases) {
+            auto jt = args.as_object().find(a);
+            if (jt != args.as_object().end() && jt->second.is_string())
+                return jt->second.as_string();
+        }
     }
-    const Json& v = args.at(key);
-    if (!v.is_number() || v.as_double(-1) < 0 || v.as_double(0) != static_cast<long long>(v.as_double(0))) {
-        storage =
-            ToolResult::err(std::string(tool) + ": field `" + key + "` must be an integer");
-        failed = true;
-        return false;
-    }
-    out = static_cast<std::size_t>(v.as_double(0));
-    return true;
+    throw_hard(ToolError::bad_arguments(tool, std::string("missing string field `") + key + "`"));
 }
+
+/// Strict integer arg (read_file/grep): present-but-not-u64 throws.
+std::size_t req_usize(const Json& args, const char* key, std::size_t def, const char* tool) {
+    if (!args.is_object() || !args.contains(key)) return def;
+    const Json& v = args.at(key);
+    double d = v.as_double(-1.0);
+    if (!v.is_number() || d < 0 || d != static_cast<long long>(d))
+        throw_hard(ToolError::bad_arguments(tool, std::string("field `") + key + "` must be an integer"));
+    return static_cast<std::size_t>(d);
+}
+
+/// Lenient integer arg (pty rows/cols/wait_ms): invalid values fall back to
+/// the default, mirroring `and_then(as_u64).unwrap_or(def)`.
+std::size_t opt_u64(const Json& args, const char* key, std::size_t def) {
+    if (!args.is_object() || !args.contains(key)) return def;
+    const Json& v = args.at(key);
+    double d = v.as_double(-1.0);
+    if (!v.is_number() || d < 0 || d != static_cast<long long>(d)) return def;
+    return static_cast<std::size_t>(d);
+}
+
+std::string trim_sv(const std::string& s) {
+    std::size_t a = 0, b = s.size();
+    while (a < b && std::isspace(static_cast<unsigned char>(s[a]))) a++;
+    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) b--;
+    return s.substr(a, b - a);
+}
+
 } // namespace
 
 ToolResult fs_read_file(const Json& args) {
-    ToolResult storage = ToolResult::ok("");
-    ToolResult* errp = nullptr;
-    const char* path = req_str(args, "path", "read_file", errp, storage,
-                               {"file_path", "filepath", "file", "filename", "target", "target_file"});
-    if (!path) return storage;
-    std::size_t offset = 0, limit = 8000;
-    bool failed = false;
-    req_usize(args, "offset", 0, "read_file", offset, storage, failed);
-    if (failed) return storage;
-    req_usize(args, "limit", 8000, "read_file", limit, storage, failed);
-    if (failed) return storage;
-    limit = std::min(limit, static_cast<std::size_t>(8000));
+    std::string path =
+        req_str(args, "path", "read_file",
+                {"file_path", "filepath", "file", "filename", "target", "target_file"});
+    std::size_t offset = req_usize(args, "offset", 0, "read_file");
+    std::size_t limit = std::min(req_usize(args, "limit", 8000, "read_file"),
+                                 static_cast<std::size_t>(8000));
 
+    errno = 0;
     std::ifstream f(map_path(path), std::ios::binary);
-    if (!f) return ToolResult::err("failed to read file: " + std::string(path));
+    if (!f) throw_hard(ToolError::execution(os_error_text()));
     std::ostringstream ss;
     ss << f.rdbuf();
     std::string content = utf8_lossy(ss.str());
@@ -257,32 +269,30 @@ ToolResult fs_read_file(const Json& args) {
 }
 
 ToolResult fs_replace(const Json& args) {
-    ToolResult storage = ToolResult::ok("");
-    ToolResult* errp = nullptr;
-    const char* path =
-        req_str(args, "path", "replace", errp, storage,
+    std::string path_s =
+        req_str(args, "path", "replace",
                 {"file_path", "filepath", "file", "filename", "target", "target_file"});
-    if (!path) return storage;
-    std::string path_s = path;
-    const char* old_s =
-        req_str(args, "old_str", "replace", errp, storage, {"target", "search", "find", "old", "target_content"});
-    if (!old_s) return storage;
-    std::string old_str = old_s;
-    const char* new_s = req_str(args, "new_str", "replace", errp, storage,
-                                {"replacement", "replace", "new", "replacement_content"});
-    if (!new_s) return storage;
-    std::string new_str = new_s;
-    if (old_str.empty()) return ToolResult::err("old_str not found in file: " + path_s);
+    std::string old_str =
+        req_str(args, "old_str", "replace", {"target", "search", "find", "old", "target_content"});
+    std::string new_str = req_str(args, "new_str", "replace",
+                                  {"replacement", "replace", "new", "replacement_content"});
 
+    errno = 0;
     std::ifstream f(map_path(path_s), std::ios::binary);
-    if (!f) return ToolResult::err("failed to read file: " + path_s);
+    if (!f) throw_hard(ToolError::execution(os_error_text()));
     std::ostringstream ss;
     ss << f.rdbuf();
     std::string content = ss.str();
     std::size_t count = 0, pos = 0;
-    while ((pos = content.find(old_str, pos)) != std::string::npos) {
-        count++;
-        pos += old_str.size();
+    if (!old_str.empty()) {
+        while ((pos = content.find(old_str, pos)) != std::string::npos) {
+            count++;
+            pos += old_str.size();
+        }
+    } else {
+        // Rust "".matches("") semantics: empty needle matches at every char
+        // boundary (chars+1 matches); empty file matches exactly once.
+        count = char_count(content) + 1;
     }
     if (count == 0) return ToolResult::err("old_str not found in file: " + path_s);
     if (count > 1)
@@ -293,45 +303,52 @@ ToolResult fs_replace(const Json& args) {
     fs::path p(map_path(path_s));
     fs::path parent = p.parent_path();
     std::string parent_s = parent.empty() ? "." : parent.string();
-    std::string tmp = parent_s + "/." + p.filename().string() + ".tmp." +
-                      std::to_string(static_cast<long long>(::getpid()));
+#ifdef __unix__
+    long long pid = static_cast<long long>(::getpid());
+#else
+    long long pid = static_cast<long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+    std::string tmp = parent_s + "/." + p.filename().string() + ".tmp." + std::to_string(pid);
+    errno = 0;
     {
         std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
-        if (!o) return ToolResult::err("failed to write file: " + path_s);
+        if (!o) throw_hard(ToolError::execution(os_error_text()));
         o << updated;
+        if (!o) throw_hard(ToolError::execution(os_error_text()));
     }
     std::error_code ec;
     fs::rename(tmp, p, ec);
     if (ec) {
-        fs::remove(tmp, ec);
-        return ToolResult::err("failed to write file: " + path_s);
+        std::error_code ec2;
+        fs::remove(tmp, ec2);
+        throw_hard(ToolError::execution(ec.message() + " (os error " + std::to_string(ec.value()) + ")"));
     }
     return ToolResult::ok("replace applied");
 }
 
 ToolResult fs_write_file(const Json& args) {
-    ToolResult storage = ToolResult::ok("");
-    ToolResult* errp = nullptr;
-    const char* path =
-        req_str(args, "path", "write_file", errp, storage,
+    std::string path_s =
+        req_str(args, "path", "write_file",
                 {"file_path", "filepath", "file", "filename", "target", "target_file"});
-    if (!path) return storage;
-    std::string path_s = path;
-    const char* content = req_str(args, "content", "write_file", errp, storage,
-                                  {"contents", "text", "code", "body", "file_content"});
-    if (!content) return storage;
-    std::string body = content;
+    std::string body = req_str(args, "content", "write_file",
+                               {"contents", "text", "code", "body", "file_content"});
     fs::path p(map_path(path_s));
     if (!p.parent_path().empty()) {
         std::error_code ec;
         fs::create_directories(p.parent_path(), ec);
+        if (ec)
+            throw_hard(ToolError::execution(ec.message() + " (os error " +
+                                            std::to_string(ec.value()) + ")"));
 #ifdef __unix__
         ::chmod(p.parent_path().c_str(), 0755); // best-effort, errors ignored (as in Rust)
 #endif
     }
+    errno = 0;
     std::ofstream o(p, std::ios::binary | std::ios::trunc);
-    if (!o) return ToolResult::err("failed to write file: " + path_s);
+    if (!o) throw_hard(ToolError::execution(os_error_text()));
     o << body;
+    if (!o) throw_hard(ToolError::execution(os_error_text()));
     return ToolResult::ok("wrote " + std::to_string(body.size()) + " bytes to " + path_s);
 }
 
@@ -453,28 +470,22 @@ std::string glob_to_regex_str(const std::string& pattern) {
 } // namespace
 
 ToolResult search_grep(const Json& args) {
-    ToolResult storage = ToolResult::ok("");
-    ToolResult* errp = nullptr;
-    const char* pattern =
-        req_str(args, "pattern", "grep_search", errp, storage, {"query", "search", "glob", "regex"});
-    if (!pattern) return storage;
-    std::string pat = pattern;
+    std::string pat =
+        req_str(args, "pattern", "grep_search", {"query", "search", "glob", "regex"});
     std::string root = ".";
     if (args.is_object()) {
         auto it = args.as_object().find("path");
         if (it != args.as_object().end() && it->second.is_string()) root = it->second.as_string();
     }
-    std::size_t max_results = 100;
-    bool failed = false;
-    req_usize(args, "max_results", 100, "grep_search", max_results, storage, failed);
-    if (failed) return storage;
-    max_results = std::min(max_results, static_cast<std::size_t>(500));
+    std::size_t max_results = std::min(req_usize(args, "max_results", 100, "grep_search"),
+                                       static_cast<std::size_t>(500));
 
     std::regex re;
     try {
         re = std::regex(pat);
     } catch (const std::regex_error& e) {
-        return ToolResult::err("grep_search: invalid regex: " + std::string(e.what()));
+        throw_hard(ToolError::bad_arguments("grep_search",
+                                            std::string("invalid regex: ") + e.what()));
     }
     auto pats = load_gitignore();
     std::vector<std::string> results;
@@ -538,11 +549,8 @@ ToolResult search_grep(const Json& args) {
 }
 
 ToolResult search_glob(const Json& args) {
-    ToolResult storage = ToolResult::ok("");
-    ToolResult* errp = nullptr;
-    const char* pattern =
-        req_str(args, "pattern", "glob", errp, storage, {"query", "search", "glob", "regex"});
-    if (!pattern) return storage;
+    std::string pattern =
+        req_str(args, "pattern", "glob", {"query", "search", "glob", "regex"});
     std::regex re;
     try {
         re = std::regex(glob_to_regex_str(pattern));
@@ -721,12 +729,10 @@ std::string run_command_pty(const std::string& command, std::chrono::seconds tim
 }
 
 ToolResult pty_run_command(const Json& args) {
-    ToolResult storage = ToolResult::ok("");
-    ToolResult* errp = nullptr;
-    const char* cmd = req_str(args, "command", "run_command", errp, storage,
-                              {"cmd", "script", "exec", "command_line"});
-    if (!cmd) return storage;
-    // NOTE: any `timeout` arg is ignored in v0.1 — always 300s.
+    std::string cmd =
+        req_str(args, "command", "run_command", {"cmd", "script", "exec", "command_line"});
+    // NOTE: a `timeout` argument is accepted for forward-compatibility but the
+    // timeout is strict — always DEFAULT_TIMEOUT_SECS (300 s).
     return ToolResult::ok(run_command_pty(cmd, std::chrono::seconds(300)));
 }
 
@@ -779,33 +785,27 @@ std::string take_delta(const std::shared_ptr<InteractiveSession>& sess) {
     sess->last_activity = std::chrono::steady_clock::now();
     return sanitize_terminal_output(delta);
 }
-const char* session_id_of(const Json& args) {
-    if (!args.is_object()) return nullptr;
-    for (auto k : {"id", "session_id"}) {
-        auto it = args.as_object().find(k);
-        if (it != args.as_object().end() && it->second.is_string())
-            return it->second.as_string().c_str();
+/// Session id with the exact upstream lookup + BadArguments detail.
+std::string session_id_of(const Json& args, const char* tool) {
+    if (args.is_object()) {
+        for (auto k : {"id", "session_id"}) {
+            auto it = args.as_object().find(k);
+            if (it != args.as_object().end() && it->second.is_string())
+                return it->second.as_string();
+        }
     }
-    return nullptr;
+    throw_hard(ToolError::bad_arguments(tool, "missing string field `id` or `session_id`"));
 }
 } // namespace
 
 ToolResult pty_spawn(const Json& args) {
 #ifdef __unix__
-    const char* id = session_id_of(args);
-    if (!id) return ToolResult::err("pty_spawn: missing string field `id`");
-    std::string sid = id;
-    ToolResult storage = ToolResult::ok("");
-    ToolResult* errp = nullptr;
-    const char* cmd = req_str(args, "command", "pty_spawn", errp, storage, {});
-    if (!cmd) return storage;
-    std::string command = cmd;
-    std::size_t rows = 24, cols = 80;
-    bool failed = false;
-    req_usize(args, "rows", 24, "pty_spawn", rows, storage, failed);
-    if (failed) return storage;
-    req_usize(args, "cols", 80, "pty_spawn", cols, storage, failed);
-    if (failed) return storage;
+    std::string sid = session_id_of(args, "pty_spawn");
+    if (!(args.is_object() && args.contains("command") && args.at("command").is_string()))
+        throw_hard(ToolError::bad_arguments("pty_spawn", "missing string field `command`"));
+    std::string command = args.at("command").as_string();
+    std::size_t rows = opt_u64(args, "rows", 24);
+    std::size_t cols = opt_u64(args, "cols", 80);
 
     auto& st = pty_state();
     {
@@ -818,7 +818,13 @@ ToolResult pty_spawn(const Json& args) {
     ws.ws_col = static_cast<unsigned short>(cols ? cols : 80);
     int master = -1;
     pid_t pid = ::forkpty(&master, nullptr, nullptr, &ws);
-    if (pid < 0) return ToolResult::err("pty_spawn: failed to spawn pty");
+    if (pid < 0) {
+        int e = errno;
+        throw_hard(ToolError::execution(
+            std::string("Failed to create PTY: ") +
+            (e ? std::string(std::strerror(e)) + " (os error " + std::to_string(e) + ")"
+               : "unknown error")));
+    }
     if (pid == 0) {
         std::string wrapped = wrapped_interactive(command);
         ::execl("/bin/sh", "sh", "-c", wrapped.c_str(), (char*)nullptr);
@@ -860,28 +866,26 @@ ToolResult pty_spawn(const Json& args) {
 
 ToolResult pty_write(const Json& args) {
 #ifdef __unix__
-    const char* id = session_id_of(args);
-    if (!id) return ToolResult::err("pty_write: missing string field `id`");
-    std::string sid = id;
-    ToolResult storage = ToolResult::ok("");
-    ToolResult* errp = nullptr;
-    const char* input = req_str(args, "input", "pty_write", errp, storage, {});
-    if (!input) return storage;
-    std::string text = input;
-    std::size_t wait_ms = 300;
-    bool failed = false;
-    req_usize(args, "wait_ms", 300, "pty_write", wait_ms, storage, failed);
-    if (failed) return storage;
+    std::string sid = session_id_of(args, "pty_write");
+    std::string text;
+    if (args.is_object()) {
+        auto it = args.as_object().find("input");
+        if (it != args.as_object().end() && it->second.is_string()) text = it->second.as_string();
+    }
+    if (!(args.is_object() && args.contains("input") && args.at("input").is_string()))
+        throw_hard(ToolError::bad_arguments("pty_write", "missing string field `input`"));
+    std::size_t wait_ms = opt_u64(args, "wait_ms", 300);
     auto& st = pty_state();
     std::shared_ptr<InteractiveSession> sess;
     {
         std::lock_guard<std::mutex> l(st.mutex);
         reap_idle(st);
-        auto it = st.sessions.find(sid);
+        auto it = st.sessions.find(trim_sv(sid));
         if (it == st.sessions.end())
-            return ToolResult::err("PTY session '" + sid +
-                                   "' not found or was terminated. Please call pty_spawn to start "
-                                   "a new terminal session.");
+            throw_hard(ToolError::execution(
+                "PTY session '" + sid +
+                "' not found or was terminated. Please call pty_spawn to start a new terminal "
+                "session."));
         sess = it->second;
     }
     {
@@ -892,10 +896,19 @@ ToolResult pty_write(const Json& args) {
     std::size_t left = text.size();
     while (left > 0) {
         ssize_t n = ::write(sess->master, p, left);
-        if (n <= 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            throw_hard(ToolError::execution(
+                std::string("Failed to write to PTY: ") +
+                (e ? std::string(std::strerror(e)) + " (os error " + std::to_string(e) + ")"
+                   : "unknown error")));
+        }
+        if (n == 0) break;
         p += n;
         left -= static_cast<std::size_t>(n);
     }
+    // NOTE: upstream flushes a BufWriter here; the raw fd needs no flush.
     std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms ? wait_ms : 300));
     std::string out = take_delta(sess);
     bool alive;
@@ -913,24 +926,19 @@ ToolResult pty_write(const Json& args) {
 
 ToolResult pty_read(const Json& args) {
 #ifdef __unix__
-    const char* id = session_id_of(args);
-    if (!id) return ToolResult::err("pty_read: missing string field `id`");
-    std::string sid = id;
-    ToolResult storage = ToolResult::ok("");
-    std::size_t wait_ms = 0;
-    bool failed = false;
-    req_usize(args, "wait_ms", 0, "pty_read", wait_ms, storage, failed);
-    if (failed) return storage;
+    std::string sid = session_id_of(args, "pty_read");
+    std::size_t wait_ms = opt_u64(args, "wait_ms", 0);
     auto& st = pty_state();
     std::shared_ptr<InteractiveSession> sess;
     {
         std::lock_guard<std::mutex> l(st.mutex);
         reap_idle(st);
-        auto it = st.sessions.find(sid);
+        auto it = st.sessions.find(trim_sv(sid));
         if (it == st.sessions.end())
-            return ToolResult::err("PTY session '" + sid +
-                                   "' not found or was terminated. Please call pty_spawn to start "
-                                   "a new terminal session.");
+            throw_hard(ToolError::execution(
+                "PTY session '" + sid +
+                "' not found or was terminated. Please call pty_spawn to start a new terminal "
+                "session."));
         sess = it->second;
     }
     if (wait_ms) std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
@@ -949,14 +957,13 @@ ToolResult pty_read(const Json& args) {
 }
 
 ToolResult pty_close(const Json& args) {
-    const char* id = session_id_of(args);
-    if (!id) return ToolResult::err("pty_close: missing string field `id`");
-    std::string sid = id;
+    std::string sid = session_id_of(args, "pty_close");
+    std::string key = trim_sv(sid);
     auto& st = pty_state();
     std::shared_ptr<InteractiveSession> sess;
     {
         std::lock_guard<std::mutex> l(st.mutex);
-        auto it = st.sessions.find(sid);
+        auto it = st.sessions.find(key);
         if (it == st.sessions.end()) return ToolResult::ok("PTY session '" + sid + "' was not running.");
         sess = it->second;
         st.sessions.erase(it);
@@ -988,10 +995,10 @@ ToolResult pty_list(const Json& args) {
                   Json(static_cast<long long>(
                       std::chrono::duration_cast<std::chrono::seconds>(now - sess->last_activity)
                           .count())));
-        o.emplace("total_bytes_read", Json(static_cast<long long>(sess->cursor)));
+        o.emplace("total_bytes_read", Json(static_cast<long long>(sess->output.size())));
         arr.push_back(Json(std::move(o)));
     }
-    return ToolResult::ok(Json(std::move(arr)).dump());
+    return ToolResult::ok(Json(std::move(arr)).dump_pretty());
 }
 
 // --- mod.rs dispatcher ------------------------------------------------------------------
@@ -1091,121 +1098,124 @@ ToolResult apply_tool_output_length_limit(ToolResult res) {
     return res;
 }
 
-ToolResult dispatch(const ToolInvocation& inv) {
-    if (mcp_has_tool(inv.name)) {
-        ToolResult r = mcp_call_tool(inv.name, inv.arguments);
-        return apply_tool_output_length_limit(r);
+/// Outcome-threaded dispatcher core: soft branches return normally,
+/// Rust `Err(ToolError)` branches throw HardToolError (or std::exception for
+/// Execution IO failures). Mirrors `?` propagation; truncation applies to
+/// soft results only (`Result::map` semantics).
+static HarnessOutcome guard_outcome(std::function<ToolResult()> fn) {
+    try {
+        return {fn(), false};
+    } catch (const HardToolError& e) {
+        return {ToolResult::err(e.what()), true};
+    } catch (const std::exception& e) {
+        return {ToolResult::err(e.what()), true};
     }
-    const std::string& n = inv.name;
-    ToolResult r = ToolResult::err("unknown tool: " + n);
-    if (n == "delegate_task") {
-        auto [ok, content] = orchestrator::handle_delegate_task(inv.arguments);
-        r = ok ? ToolResult::ok(content) : ToolResult::err(content);
-    } else if (name_in(n, {"read_file", "terminal__read_file", "view_file", "get_file", "read"})) {
-        // fs_read_file handles the full alias set internally.
-        r = fs_read_file(inv.arguments);
-        goto done;
-    } else if (name_in(n, {"replace", "terminal__replace", "replace_file_content", "edit_file"})) {
-        r = fs_replace(inv.arguments);
-        goto done;
-    } else if (name_in(n, {"write_file", "terminal__write_file", "create_file", "write_to_file",
-                           "save_file", "write"})) {
-        r = fs_write_file(inv.arguments);
-        goto done;
-    } else if (name_in(n, {"run_command", "terminal__run_command", "execute_command", "run", "exec",
-                           "bash", "sh", "cmd"})) {
-        r = pty_run_command(inv.arguments);
-        goto done;
-    } else if (name_in(n, {"grep_search", "terminal__grep_search", "grep", "search"})) {
-        r = search_grep(inv.arguments);
-        goto done;
-    } else if (name_in(n, {"glob", "terminal__glob", "find_files", "glob_search"})) {
-        r = search_glob(inv.arguments);
-        goto done;
-    } else if (n == "pty_spawn" || n == "pty__spawn") {
-        r = pty_spawn(inv.arguments);
-        goto done;
-    } else if (n == "pty_write" || n == "pty__write") {
-        r = pty_write(inv.arguments);
-        goto done;
-    } else if (n == "pty_read" || n == "pty__read") {
-        r = pty_read(inv.arguments);
-        goto done;
-    } else if (n == "pty_close" || n == "pty__close") {
-        r = pty_close(inv.arguments);
-        goto done;
-    } else if (n == "pty_list" || n == "pty__list") {
-        r = pty_list(inv.arguments);
-        goto done;
-    } else if (n == "create_plan") {
-        std::string md = opt_str(inv.arguments, {"plan_markdown", "plan"});
-        if (md.empty())
-            r = ToolResult::err("create_plan requires a `plan_markdown` or `plan` string argument");
-        else
-            r = write_plan_impl(md);
-    } else if (n == "archive_current_plan") {
-        r = archive_plan_impl();
-    } else if (n == "rebirth") {
-        r = ToolResult::err("rebirth requires a live ContextEngine; use dispatch_with_engine");
-    }
-done:
-    return apply_tool_output_length_limit(r);
 }
 
-ToolResult dispatch_manager(const ToolInvocation& inv) {
+static ToolResult map_delegate(const orchestrator::DelegateOutcome& d) {
+    if (!d.ok && d.hard) throw_hard(ToolError::execution(d.content));
+    return d.ok ? ToolResult::ok(d.content) : ToolResult::err(d.content);
+}
+
+static ToolResult dispatch_soft_body(const ToolInvocation& inv) {
     const std::string& n = inv.name;
-    bool read_ok = name_in(n, {"read_file", "terminal__read_file", "grep_search",
-                               "terminal__grep_search", "glob", "terminal__glob"});
     if (n == "delegate_task") {
-        auto [ok, content] = orchestrator::handle_delegate_task(inv.arguments);
-        ToolResult r = ok ? ToolResult::ok(content) : ToolResult::err(content);
-        return r;
+        return map_delegate(orchestrator::handle_delegate_task(inv.arguments));
+    } else if (name_in(n, {"read_file", "terminal__read_file", "view_file", "get_file", "read"})) {
+        return fs_read_file(inv.arguments);
+    } else if (name_in(n, {"replace", "terminal__replace", "replace_file_content", "edit_file"})) {
+        return fs_replace(inv.arguments);
+    } else if (name_in(n, {"write_file", "terminal__write_file", "create_file", "write_to_file",
+                           "save_file", "write"})) {
+        return fs_write_file(inv.arguments);
+    } else if (name_in(n, {"run_command", "terminal__run_command", "execute_command", "run", "exec",
+                           "bash", "sh", "cmd"})) {
+        return pty_run_command(inv.arguments);
+    } else if (name_in(n, {"grep_search", "terminal__grep_search", "grep", "search"})) {
+        return search_grep(inv.arguments);
+    } else if (name_in(n, {"glob", "terminal__glob", "find_files", "glob_search"})) {
+        return search_glob(inv.arguments);
+    } else if (n == "pty_spawn" || n == "pty__spawn") {
+        return pty_spawn(inv.arguments);
+    } else if (n == "pty_write" || n == "pty__write") {
+        return pty_write(inv.arguments);
+    } else if (n == "pty_read" || n == "pty__read") {
+        return pty_read(inv.arguments);
+    } else if (n == "pty_close" || n == "pty__close") {
+        return pty_close(inv.arguments);
+    } else if (n == "pty_list" || n == "pty__list") {
+        return pty_list(inv.arguments);
+    } else if (n == "create_plan") {
+        bool has = inv.arguments.is_object() &&
+                   ((inv.arguments.contains("plan_markdown") &&
+                     inv.arguments.at("plan_markdown").is_string()) ||
+                    (inv.arguments.contains("plan") && inv.arguments.at("plan").is_string()));
+        if (!has)
+            return ToolResult::err(
+                "create_plan requires a `plan_markdown` or `plan` string argument");
+        return write_plan_impl(opt_str(inv.arguments, {"plan_markdown", "plan"}));
+    } else if (n == "archive_current_plan") {
+        return archive_plan_impl();
+    } else if (n == "rebirth") {
+        throw_hard(ToolError::bad_arguments(
+            "rebirth", "rebirth requires a live ContextEngine; use dispatch_with_engine"));
+    }
+    throw_hard(ToolError::unknown(n));
+}
+
+static ToolResult dispatch_manager_soft_body(const ToolInvocation& inv) {
+    const std::string& n = inv.name;
+    if (n == "delegate_task") {
+        return map_delegate(orchestrator::handle_delegate_task(inv.arguments));
     }
     if (n == "create_plan") {
-        std::string md = opt_str(inv.arguments, {"plan", "plan_markdown"});
-        if (md.empty())
+        bool has = inv.arguments.is_object() &&
+                   ((inv.arguments.contains("plan") && inv.arguments.at("plan").is_string()) ||
+                    (inv.arguments.contains("plan_markdown") &&
+                     inv.arguments.at("plan_markdown").is_string()));
+        if (!has)
             return ToolResult::err("create_plan requires a `plan` or `plan_markdown` string argument");
-        return write_plan_impl(md);
+        return write_plan_impl(opt_str(inv.arguments, {"plan", "plan_markdown"}));
     }
     if (n == "archive_current_plan") return archive_plan_impl();
     if (n == "rebirth")
-        return ToolResult::err("rebirth requires a live ContextEngine; use dispatch_with_engine");
-    if (read_ok) {
-        if (name_in(n, {"read_file", "terminal__read_file"})) return fs_read_file(inv.arguments);
-        if (name_in(n, {"grep_search", "terminal__grep_search"})) return search_grep(inv.arguments);
-        return search_glob(inv.arguments);
-    }
-    return ToolResult::err("forbidden: tool `" + n + "` is not available to Manager");
+        throw_hard(ToolError::bad_arguments(
+            "rebirth", "rebirth requires a live ContextEngine; use dispatch_with_engine"));
+    // NOTE: base names only — terminal__* aliases are Forbidden for the
+    // Manager, exactly as in Rust dispatch_manager.
+    if (n == "read_file") return fs_read_file(inv.arguments);
+    if (n == "grep_search") return search_grep(inv.arguments);
+    if (n == "glob") return search_glob(inv.arguments);
+    throw_hard(ToolError::forbidden(n, "Manager"));
 }
 
-ToolResult dispatch_specialist(agents::Agent agent, const ToolInvocation& inv) {
+static ToolResult dispatch_specialist_soft_body(agents::Agent agent, const ToolInvocation& inv) {
     const std::string& n = inv.name;
     if (n == "create_plan")
-        return ToolResult::err("forbidden: tool `create_plan` is not available to " +
-                               agents::agent_to_string(agent));
+        throw_hard(ToolError::forbidden("create_plan", agents::agent_to_string(agent)));
     if (mcp_has_tool(n)) {
-        ToolResult r = mcp_call_tool(n, inv.arguments);
-        return r;
+        return mcp_call_tool(n, inv.arguments);
     }
     std::string gate = normalize_tool_name(n);
     if (!agents::caller_allows_tool(agent, gate, agents::SpecialistRegistry::canonical()))
-        return ToolResult::err("forbidden: tool `" + n + "` is not available to " +
-                               agents::agent_to_string(agent));
+        throw_hard(ToolError::forbidden(n, agents::agent_to_string(agent)));
     if (n == "leave_verdict") {
-        std::string verdict = opt_str(inv.arguments, {"verdict"});
+        std::string verdict = "APPROVED";
+        if (inv.arguments.is_object() && inv.arguments.contains("verdict") &&
+            inv.arguments.at("verdict").is_string())
+            verdict = inv.arguments.at("verdict").as_string();
         std::string comments = opt_str(inv.arguments, {"comments", "comment", "feedback", "reason",
                                                        "critique", "details", "explanation"});
-        if (verdict.empty()) verdict = "APPROVED";
         return ToolResult::ok("Verdict recorded via leave_verdict: " + verdict +
                               " with comments: " + comments);
     }
     if (n == "delegate_task") {
-        auto [ok, content] = orchestrator::handle_delegate_task(inv.arguments);
-        return ok ? ToolResult::ok(content) : ToolResult::err(content);
+        return map_delegate(orchestrator::handle_delegate_task(inv.arguments));
     }
     if (n == "archive_current_plan") return archive_plan_impl();
     if (n == "rebirth")
-        return ToolResult::err("rebirth requires a live ContextEngine; use dispatch_with_engine");
+        throw_hard(ToolError::bad_arguments(
+            "rebirth", "rebirth requires a live ContextEngine; use dispatch_with_engine"));
     if (name_in(n, {"read_file", "terminal__read_file", "view_file", "get_file", "read"}))
         return fs_read_file(inv.arguments);
     if (name_in(n, {"replace", "terminal__replace", "replace_file_content", "edit_file"}))
@@ -1225,29 +1235,67 @@ ToolResult dispatch_specialist(agents::Agent agent, const ToolInvocation& inv) {
     if (n == "pty_read" || n == "pty__read") return pty_read(inv.arguments);
     if (n == "pty_close" || n == "pty__close") return pty_close(inv.arguments);
     if (n == "pty_list" || n == "pty__list") return pty_list(inv.arguments);
-    return ToolResult::err("unknown tool: " + n);
+    throw_hard(ToolError::unknown(n));
 }
 
+static HarnessOutcome truncate_outcome(HarnessOutcome o) {
+    if (!o.hard_error) o.result = apply_tool_output_length_limit(o.result);
+    return o;
+}
+
+static HarnessOutcome dispatch_outcome_inner(const ToolInvocation& inv,
+                                             const agent::ToolCaller& caller) {
+    if (caller.kind == agent::ToolCallerKind::Manager)
+        return guard_outcome([&] { return dispatch_manager_soft_body(inv); });
+    agents::Agent agent =
+        agents::agent_from_str(caller.agent).value_or(agents::Agent::Generalist);
+    return guard_outcome([&] { return dispatch_specialist_soft_body(agent, inv); });
+}
+
+ToolResult dispatch(const ToolInvocation& inv) {
+    if (mcp_has_tool(inv.name)) {
+        ToolResult r = mcp_call_tool(inv.name, inv.arguments);
+        return apply_tool_output_length_limit(r);
+    }
+    return truncate_outcome(guard_outcome([&] { return dispatch_soft_body(inv); })).result;
+}
+
+ToolResult dispatch_manager(const ToolInvocation& inv) {
+    return guard_outcome([&] { return dispatch_manager_soft_body(inv); }).result;
+}
+
+ToolResult dispatch_specialist(agents::Agent agent, const ToolInvocation& inv) {
+    return guard_outcome([&] { return dispatch_specialist_soft_body(agent, inv); }).result;
+}
+
+
 ToolResult handle_rebirth(agent::ContextEngine& engine, const Json& args) {
-    std::string summary = opt_str(args, {"summary"});
-    if (summary.empty())
-        return ToolResult::err("rebirth: missing string field `summary`");
-    engine.perform_rebirth(summary);
+    if (!(args.is_object() && args.contains("summary") && args.at("summary").is_string()))
+        throw_hard(ToolError::bad_arguments("rebirth", "rebirth requires a `summary` string argument"));
+    engine.perform_rebirth(args.at("summary").as_string());
     return ToolResult::ok("Rebirth: compacted history and summarized progress.");
 }
 
+HarnessOutcome dispatch_with_engine_outcome(const ToolInvocation& inv,
+                                           agent::ContextEngine& engine) {
+    if (inv.name == "rebirth") return guard_outcome([&] { return handle_rebirth(engine, inv.arguments); });
+    if (mcp_has_tool(inv.name)) {
+        ToolResult r = mcp_call_tool(inv.name, inv.arguments);
+        return {apply_tool_output_length_limit(r), false};
+    }
+    return truncate_outcome(guard_outcome([&] { return dispatch_soft_body(inv); }));
+}
+
 ToolResult dispatch_with_engine(const ToolInvocation& inv, agent::ContextEngine& engine) {
-    if (inv.name == "rebirth") return handle_rebirth(engine, inv.arguments);
-    return dispatch(inv);
+    return dispatch_with_engine_outcome(inv, engine).result;
+}
+
+HarnessOutcome dispatch_for_outcome(const ToolInvocation& inv, const agent::ToolCaller& caller) {
+    return truncate_outcome(dispatch_outcome_inner(inv, caller));
 }
 
 ToolResult dispatch_for(const ToolInvocation& inv, const agent::ToolCaller& caller) {
-    ToolResult r = (caller.kind == agent::ToolCallerKind::Manager)
-                       ? dispatch_manager(inv)
-                       : dispatch_specialist(agents::agent_from_str(caller.agent).value_or(
-                                                 agents::Agent::Generalist),
-                                             inv);
-    return apply_tool_output_length_limit(r);
+    return dispatch_for_outcome(inv, caller).result;
 }
 
 ToolResult dispatch_for_json(const std::string& name, const Json& args,

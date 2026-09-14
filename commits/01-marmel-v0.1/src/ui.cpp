@@ -79,18 +79,13 @@ std::string load_system_prompt(const config::Config& cfg) {
 
 std::string classify_llm_error(const std::string& e) {
     std::string l = to_lower(e);
-    if (l.find("http status") != std::string::npos || l.find("http/") != std::string::npos ||
-        l.find("status ") != std::string::npos)
+    if (l.find("http") != std::string::npos || l.find("status") != std::string::npos ||
+        l.find("503") != std::string::npos || l.find("429") != std::string::npos)
         return "http";
-    if (l.find("timeout") != std::string::npos || l.find("timed out") != std::string::npos ||
-        l.find("deadline") != std::string::npos)
-        return "timeout";
-    if (l.find("connect") != std::string::npos || l.find("transport") != std::string::npos ||
-        l.find("curl") != std::string::npos || l.find("resolve") != std::string::npos ||
-        l.find("network") != std::string::npos)
+    if (l.find("transport") != std::string::npos || l.find("connection") != std::string::npos)
         return "connectivity";
-    if (l.find("stream") != std::string::npos || l.find("sse") != std::string::npos ||
-        l.find("event") != std::string::npos)
+    if (l.find("timeout") != std::string::npos) return "timeout";
+    if (l.find("stream") != std::string::npos || l.find("sse") != std::string::npos)
         return "stream";
     return "unknown";
 }
@@ -100,8 +95,12 @@ void handle_reset_command(const agent::Plan& plan, Renderer& renderer, agent::Co
         plan.clear();
     } catch (...) {
     }
-    renderer.on_event(UiEvent::status("execution plan cleared; phase reset to Conversational"));
-    (void)ctx;
+    renderer.on_event(UiEvent::message("Execution plan has been cleared and reset by user."));
+    renderer.on_event(UiEvent::status("Execution plan reset"));
+    renderer.flush();
+    ctx.append(types::Message::user(
+        "[System] User executed /reset. The execution plan has been removed from disk. Return to "
+        "Conversational phase."));
 }
 
 std::string subagent_key(const std::string& agent, const std::optional<std::string>& task) {
@@ -419,45 +418,53 @@ int run_session_with_chat(const config::Config& cfg, Renderer& renderer,
             auto run_one = [&](const types::ToolCall& c) {
                 Json args = Json::parse_or_string(c.arguments);
                 if (!args.is_object()) args = Json::object();
-                // Pre-announce delegations for subagent-pane visibility.
-                if (c.name == "delegate_task") {
-                    auto ag = agents::agent_from_str(args.str_or("agent_name", ""));
-                    std::optional<std::string> tid;
+                bool is_delegate = (c.name == "delegate_task");
+                std::optional<agents::Agent> ag;
+                std::optional<std::string> tid;
+                bool known_delegate = false;
+                if (is_delegate) {
+                    ag = agents::agent_from_str(args.str_or("agent_name", ""));
                     if (args.contains("task_id") && args.at("task_id").is_string())
                         tid = args.at("task_id").as_string();
-                    std::string pr = args.str_or("prompt", "");
-                    if (ag)
+                    if (ag) {
+                        known_delegate = true;
+                        std::string pr = args.str_or("prompt", "");
                         update_subagent_lifecycle(subagents, *ag, tid, pr, true);
-                    renderer.on_event(UiEvent::tool_call(c.name + "(" + c.arguments + ")"));
+                        renderer.on_event(UiEvent::delegation_ev(
+                            {orchestrator::DelegationEvent::Kind::Started, *ag, tid}));
+                    } else {
+                        renderer.on_event(UiEvent::tool_call(c.name + "(" + c.arguments + ")"));
+                    }
                 } else {
                     renderer.on_event(UiEvent::tool_call(c.name + "(" + c.arguments + ")"));
                 }
-                harness::ToolResult r =
-                    harness::dispatch_for(harness::ToolInvocation{c.name, args}, caller);
-                renderer.on_event(UiEvent::tool_result(r.content));
-                if (c.name == "delegate_task") {
-                    auto ag = agents::agent_from_str(args.str_or("agent_name", ""));
-                    std::optional<std::string> tid;
-                    if (args.contains("task_id") && args.at("task_id").is_string())
-                        tid = args.at("task_id").as_string();
-                    if (ag) update_subagent_lifecycle(subagents, *ag, tid, std::nullopt, false);
+                harness::HarnessOutcome outcome = harness::dispatch_for_outcome(
+                    harness::ToolInvocation{c.name, args}, caller);
+                std::string content = outcome.hard_error ? "ERROR: " + outcome.result.content
+                                                         : outcome.result.content;
+                if (known_delegate) {
+                    update_subagent_lifecycle(subagents, *ag, tid, std::nullopt, false);
+                    renderer.on_event(UiEvent::delegation_ev(
+                        {orchestrator::DelegationEvent::Kind::Completed, *ag, tid}));
+                } else {
+                    renderer.on_event(UiEvent::tool_result(content));
                 }
                 renderer.set_subagents(subagents);
-                return std::make_pair(c.id, r);
+                return std::make_pair(c.id, content);
             };
             if (all_parallel) {
-                std::vector<std::future<std::pair<std::string, harness::ToolResult>>> handles;
+                std::vector<std::future<std::pair<std::string, std::string>>> handles;
                 for (auto& c : tool_calls)
                     handles.push_back(std::async(std::launch::async, run_one, c));
                 for (auto& h : handles) {
-                    auto [call_id, r] = h.get();
-                    ctx.append(types::Message::tool(call_id, r.content));
+                    auto [call_id, content] = h.get();
+                    ctx.append(types::Message::tool(call_id, content));
                 }
             } else {
                 for (auto& c : tool_calls) {
                     if (renderer.aborted()) break;
-                    auto [call_id, r] = run_one(c);
-                    ctx.append(types::Message::tool(call_id, r.content));
+                    auto [call_id, content] = run_one(c);
+                    ctx.append(types::Message::tool(call_id, content));
                     drain_status_queue(renderer);
                     drain_delegation_events(manager.get(), renderer, subagents);
                 }
@@ -750,10 +757,14 @@ void TuiRenderer::draw() {
     }
     std::cout << "\x1b[H\x1b[2J";
     std::cout << "=== Chat & Logs (Tab: focus) ===\n";
-    std::size_t from = 0;
-    if (messages_.size() > 30) from = messages_.size() - 30;
     if (chat_scroll_ < 0) chat_scroll_ = 0;
-    for (std::size_t i = from; i < messages_.size(); i++) std::cout << messages_[i] << "\n";
+    long window = 30;
+    long total = static_cast<long>(messages_.size());
+    long from_l = total - window - chat_scroll_;
+    if (from_l < 0) from_l = 0;
+    if (from_l > total) from_l = total;
+    for (std::size_t i = static_cast<std::size_t>(from_l); i < messages_.size(); i++)
+        std::cout << messages_[i] << "\n";
     if (show_plan_) {
         std::cout << "--- Execution Plan ---\n" << plan_content_ << "\n";
     }

@@ -295,7 +295,8 @@ std::vector<std::string> parse_unchecked_tasks(const std::string& markdown) {
 }
 std::vector<std::string> parse_all_tasks(const std::string& markdown) {
     static const std::regex re(
-        R"(^\s*[-*]\s*\[[\s*xX?]*\]\s*\*{0,2}\[?(t-[A-Za-z0-9_-]+)\]?\*{0,2})", std::regex::icase);
+        R"(^\s*[-*]\s*\[\s*[ xX]?\s*\]\s*\*{0,2}\[?(t-[A-Za-z0-9_-]+)\]?\*{0,2})",
+        std::regex::icase);
     return collect_task_ids(markdown, re);
 }
 
@@ -412,24 +413,29 @@ bool Plan::check_off(const std::string& task_id) const {
     std::string content = ss.str();
     std::string needle = to_upper(task_id);
     static const std::regex box(R"(\[\s*\])");
-    std::istringstream in(content);
-    std::string line, out;
+    // Rust lines()/join("\n") semantics: no forced trailing newline.
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(content);
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+    }
     bool flipped = false;
-    bool first = true;
-    while (std::getline(in, line)) {
+    for (auto& line : lines) {
         if (!flipped && contains_ci(line, needle) && std::regex_search(line, box)) {
             line = std::regex_replace(line, box, "[x]", std::regex_constants::format_first_only);
             flipped = true;
         }
-        if (!first) out += '\n';
-        first = false;
-        out += line;
     }
     if (!flipped) return false;
+    std::string out;
+    for (std::size_t i = 0; i < lines.size(); i++) {
+        if (i) out += '\n';
+        out += lines[i];
+    }
     {
         std::ofstream o(plan_path(), std::ios::binary | std::ios::trunc);
         o << out;
-        if (!out.empty() && out.back() != '\n') o << '\n';
     }
     static const std::regex unchecked(R"(\[\s*\]|\(\s*\))");
     static const std::regex checked(R"(\[[xX]\]|\([xX]\))");
@@ -509,12 +515,12 @@ const char* phase_name(TurnPhase p) {
 }
 
 bool is_read_tool(const std::string& name) {
-    return name == "read_file" || name == "terminal__read_file" || name == "grep_search" ||
-           name == "terminal__grep_search" || name == "glob" || name == "terminal__glob";
+    // Base names only (matches TOOL_* constants): terminal__* aliases match
+    // neither class and are dropped silently, exactly as in Rust.
+    return name == "read_file" || name == "grep_search" || name == "glob";
 }
 bool is_write_tool(const std::string& name) {
-    return name == "write_file" || name == "terminal__write_file" || name == "replace" ||
-           name == "terminal__replace" || name == "run_command" || name == "terminal__run_command" ||
+    return name == "write_file" || name == "replace" || name == "run_command" ||
            name == "delegate_task";
 }
 std::optional<std::string> extract_task_id(const std::string& name, const Json& args) {

@@ -44,6 +44,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -84,6 +85,15 @@ struct ToolError {
     static ToolError forbidden(std::string tool, std::string caller);
     static ToolError execution(std::string detail);
 };
+
+/// Thrown for Rust `Err(ToolError)` paths (vs soft `Ok(ToolResult::err)`
+/// paths) so the hard/soft distinction survives dispatch. Carries the exact
+/// thiserror Display text in what().
+struct HardToolError : std::runtime_error {
+    ToolError error;
+    explicit HardToolError(ToolError e) : std::runtime_error(e.message()), error(std::move(e)) {}
+};
+[[noreturn]] inline void throw_hard(ToolError e) { throw HardToolError(std::move(e)); }
 
 struct ToolInvocation {
     std::string name;
@@ -260,6 +270,16 @@ ToolResult dispatch_with_engine(const ToolInvocation& inv, agent::ContextEngine&
 ToolResult handle_rebirth(agent::ContextEngine& engine, const Json& args);
 /// Policy entry used by agent loops (adds truncation).
 ToolResult dispatch_for(const ToolInvocation& inv, const agent::ToolCaller& caller);
+
+/// Hardness-preserving variant: hard_error mirrors Rust `Err(ToolError)`
+/// (transcript prefix "ERROR: "), soft errors mirror `Ok(ToolResult::err)`.
+/// Used by the UI session and live specialist transcripts.
+struct HarnessOutcome {
+    ToolResult result;
+    bool hard_error = false;
+};
+HarnessOutcome dispatch_for_outcome(const ToolInvocation& inv, const agent::ToolCaller& caller);
+HarnessOutcome dispatch_with_engine_outcome(const ToolInvocation& inv, agent::ContextEngine& engine);
 /// {name, arguments} convenience form for enqueue_tools() payloads.
 ToolResult dispatch_for_json(const std::string& name, const Json& args,
                              const agent::ToolCaller& caller);
