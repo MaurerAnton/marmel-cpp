@@ -50,9 +50,9 @@ target_link_libraries(marmel PRIVATE marmel_lib)
 enable_testing()
 add_executable(marmel_tests tests/test_marmel.cpp)
 target_link_libraries(marmel_tests PRIVATE marmel_lib)
-target_compile_definitions(marmel_tests PRIVATE
-  MARMEL_EXAMPLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/marmel.toml.example")
+target_compile_definitions(marmel_tests PRIVATE MARMEL_EXAMPLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/marmel.toml.example")
 add_test(NAME marmel_tests COMMAND marmel_tests)
 set_tests_properties(marmel_tests PROPERTIES
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
   TIMEOUT 300)
+
